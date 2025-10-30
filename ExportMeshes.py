@@ -1,89 +1,17 @@
+# ExportMeshes.py
 import os
-import struct
 import numpy as np
 import trimesh
-from collections import namedtuple
-
-Voxel = namedtuple("Voxel", ["x", "y", "z", "color_index"])
+from Vox200Parser import Vox200Parser
 
 def sanitize_filename(name):
-    return ''.join(c if c.isalnum() or c in (' ', '.', '_') else '_' for c in name).strip()
-
-def parse_vox_layers_and_models(filepath):
-    with open(filepath, "rb") as f:
-        if f.read(4) != b"VOX ":
-            raise ValueError("Not a valid VOX file")
-        version = struct.unpack("<I", f.read(4))[0]
-
-        layer_id_to_name = {}
-        model_voxels = {}
-        model_voxel_counts = {}
-        layer_ids_in_order = []
-
-        model_counter = 0
-        while True:
-            chunk_header = f.read(12)
-            if not chunk_header or len(chunk_header) < 12:
-                break
-            chunk_id, content_size, children_size = struct.unpack("<4sII", chunk_header)
-            chunk_id = chunk_id.strip()
-            content = f.read(content_size)
-
-            if chunk_id == b"LAYR":
-                layer_id = struct.unpack("<I", content[:4])[0]
-                offset = 4
-                attr_dict_len = struct.unpack("<I", content[offset:offset+4])[0]
-                offset += 4
-                name = None
-                for _ in range(attr_dict_len):
-                    if offset + 4 > len(content): break
-                    key_len = struct.unpack("<I", content[offset:offset+4])[0]
-                    offset += 4
-                    key = content[offset:offset+key_len].decode("utf-8", errors="ignore")
-                    offset += key_len
-                    if offset + 4 > len(content): break
-                    val_len = struct.unpack("<I", content[offset:offset+4])[0]
-                    offset += 4
-                    if offset + val_len > len(content): break
-                    val = content[offset:offset+val_len].decode("utf-8", errors="ignore")
-                    offset += val_len
-                    if key == "_name":
-                        name = val
-                if name is not None:
-                    layer_id_to_name[layer_id] = name
-                    layer_ids_in_order.append(layer_id)
-
-            elif chunk_id == b"XYZI":
-                if len(content) < 4:
-                    continue
-                num_voxels = struct.unpack("<I", content[:4])[0]
-                voxel_data = content[4:]
-                voxels = []
-                for i in range(num_voxels):
-                    if i * 4 + 4 > len(voxel_data):
-                        break
-                    x, y, z, color_index = struct.unpack("BBBB", voxel_data[i * 4:(i + 1) * 4])
-                    voxels.append(Voxel(x, y, z, color_index))
-                model_voxels[model_counter] = voxels
-                model_voxel_counts[model_counter] = num_voxels
-                model_counter += 1
-
-        # Build ordered list of non-"00" layer names
-        ordered_layer_names = []
-        ordered_layer_ids = []
-        for lid in layer_ids_in_order:
-            lname = layer_id_to_name.get(lid, f"Layer_{lid}")
-            if lname != "00":
-                ordered_layer_names.append(lname)
-                ordered_layer_ids.append(lid)
-
-        return model_voxels, ordered_layer_names, model_voxel_counts
+    return ''.join(c if c.isalnum() or c in (' ', '.', '_') else '_' for c in (name or "")).strip()
 
 BASE_DIR = os.path.dirname(__file__)
-EXPORT_DIR = os.path.join(BASE_DIR, "exported_meshes")
+os.chdir(BASE_DIR)
 
-if not os.path.exists(EXPORT_DIR):
-    os.makedirs(EXPORT_DIR)
+EXPORT_ROOT = os.path.join(BASE_DIR, "exported_meshes")
+os.makedirs(EXPORT_ROOT, exist_ok=True)
 
 # Find all .vox files in the folder
 vox_files = [f for f in os.listdir(BASE_DIR) if f.lower().endswith(".vox")]
@@ -94,30 +22,27 @@ else:
     for vox_file in vox_files:
         vox_path = os.path.join(BASE_DIR, vox_file)
         vox_name = os.path.splitext(vox_file)[0]
-        sub_export_dir = os.path.join(EXPORT_DIR, vox_name)
-        if not os.path.exists(sub_export_dir):
-            os.makedirs(sub_export_dir)
+        sub_export_dir = os.path.join(EXPORT_ROOT, vox_name)
+        os.makedirs(sub_export_dir, exist_ok=True)
 
-        model_voxels, ordered_layer_names, model_voxel_counts = parse_vox_layers_and_models(vox_path)
+        # Use the shared parser to obtain voxels and final name mapping (Part_X -> assigned name)
+        parser = Vox200Parser(vox_path).parse()
+        voxels_by_layer = parser.voxels_by_layer       # Ordered by XYZI chunk order
+        name_map = parser.layer_name_map               # raw_key -> chosen descriptive name
+
         export_log_path = os.path.join(sub_export_dir, "ExportLog.txt")
+        with open(export_log_path, "w", encoding="utf-8") as log_file:
+            log_file.write(f"Export Status & Layer Name Mapping for {vox_file}:\n\n")
 
-        with open(export_log_path, "w") as log_file:
-            log_file.write(f"Export Status & Layer Name Mapping (by index, skipping '00') for {vox_file}:\n\n")
-            idx = 0
-            for model_id in sorted(model_voxels.keys()):
-                voxels = model_voxels[model_id]
+            for raw_key, voxels in voxels_by_layer.items():
                 voxel_count = len(voxels)
                 if voxel_count == 0:
-                    log_file.write(f"Skipping empty model: {model_id}\n")
+                    log_file.write(f"Skipping empty model: {raw_key}\n")
                     continue
 
-                # Assign name by order, skipping '00'
-                if idx < len(ordered_layer_names):
-                    name = ordered_layer_names[idx]
-                else:
-                    name = f"Part_{model_id}"
-                safe_name = sanitize_filename(name)
-                idx += 1
+                # Use parser-provided mapping (1:1 Part_X -> name). Fallback to raw_key if not present.
+                assigned_name = name_map.get(raw_key) or raw_key
+                safe_name = sanitize_filename(assigned_name) or raw_key
 
                 positions = np.array([[v.x, v.y, v.z] for v in voxels])
                 cubes = []
@@ -130,15 +55,18 @@ else:
                     combined = trimesh.util.concatenate(cubes)
                     export_path = os.path.join(sub_export_dir, f"{safe_name}.obj")
                     combined.export(export_path)
-                    log_file.write(f"Exported: {export_path} as {name} with {voxel_count} voxels\n")
+                    log_file.write(f"Exported: {export_path} as {assigned_name} with {voxel_count} voxels\n")
                 else:
-                    log_file.write(f"Model {model_id} ({safe_name}) had no cubes to export\n")
+                    log_file.write(f"Model {raw_key} ({safe_name}) had no cubes to export\n")
 
-            log_file.write("\nOrdered Layer Names Used:\n")
-            for i, n in enumerate(ordered_layer_names):
-                log_file.write(f"  [{i}] {n}\n")
-            log_file.write("\nModel voxel counts:\n")
-            for model_id, count in model_voxel_counts.items():
-                log_file.write(f"  model {model_id}: {count} voxels\n")
+            # Write summary of mapping used
+            log_file.write("\nFinal Part -> Assigned Name mapping:\n")
+            for rk, assigned in name_map.items():
+                count = len(voxels_by_layer.get(rk, []))
+                log_file.write(f"  {rk} ({count} voxels) => {assigned}\n")
+
+            log_file.write("\nModel voxel counts (by Part_X):\n")
+            for rk, voxels in voxels_by_layer.items():
+                log_file.write(f"  {rk}: {len(voxels)} voxels\n")
 
         print(f"Export complete for {vox_file}. See {export_log_path} for details.")
