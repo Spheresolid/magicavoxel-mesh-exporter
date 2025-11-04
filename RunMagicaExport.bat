@@ -42,7 +42,7 @@ if exist "%SCRIPT_DIR%Ensure_deps.py" (
         goto :finish
     ) else if "%RC%"=="2" (
         echo User declined to install missing packages into ./deps.
-        set /p CONTINUE_WITHOUT=Continue without installing missing packages? [y/N]
+        set /p CONTINUE_WITHOUT=Continue without installing missing packages? [y/N] 
         if /I "%CONTINUE_WITHOUT%" NEQ "y" (
             echo Aborting per user request.
             set "RC=1"
@@ -107,11 +107,7 @@ if exist "%SCRIPT_DIR%PrintPartAssignments.py" (
     echo PrintPartAssignments.py not found; skipping assignment diagnostic.
 )
 
-:: (Optional) Run RenameExportsByCentroid in dry-run if you want; disabled by default to avoid side-effects.
-:: if exist "%SCRIPT_DIR%RenameExportsByCentroid.py" (
-::     echo Running RenameExportsByCentroid.py (DRY-RUN)...
-::     call "%PYTHON_CMD%" -u "%SCRIPT_DIR%RenameExportsByCentroid.py"
-:: )
+:: (Optional) Rename dry-run removed from main flow to avoid surprises; run manually if desired.
 
 :finish
 echo.
