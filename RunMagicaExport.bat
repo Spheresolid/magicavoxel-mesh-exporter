@@ -1,7 +1,18 @@
 @echo off
 setlocal ENABLEDELAYEDEXPANSION
 
-:: Resolve script directory (folder where this .bat lives)
+:: Force Python to run unbuffered so child scripts stream output immediately
+set "PYTHONUNBUFFERED=1"
+
+:: If double-clicked (no args) re-launch into an interactive child window that stays open.
+:: To run in-place from an existing console, call: RunMagicaExport.bat --child
+if "%~1"=="" (
+    start "" cmd /k "%~f0" --child
+    exit /b 0
+)
+
+:: Interactive child execution from here
+set "RC=0"
 set "SCRIPT_DIR=%~dp0"
 
 :: Locate Python
@@ -12,35 +23,31 @@ for %%P in (python3 python) do (
 
 if not defined PYTHON_CMD (
     echo Python not found. Please install Python and add it to PATH.
-    pause
-    exit /b 1
+    set "RC=1"
+    goto :finish
 )
 
 :: Ensure deps folder is used for local installs and available to Python
 set "DEPS_DIR=%SCRIPT_DIR%deps"
 set "PYTHONPATH=%DEPS_DIR%;%PYTHONPATH%"
 
-:: Run dependency checker/installer if present
+:: Run dependency checker/installer if present (unbuffered)
 if exist "%SCRIPT_DIR%Ensure_deps.py" (
     echo Checking local Python dependencies...
-    "%PYTHON_CMD%" "%SCRIPT_DIR%Ensure_deps.py"
+    call "%PYTHON_CMD%" -u "%SCRIPT_DIR%Ensure_deps.py"
     set "RC=%ERRORLEVEL%"
     if "%RC%"=="3" (
         echo Dependency installation failed. Please inspect pip output and retry.
-        pause
-        exit /b 1
+        set "RC=1"
+        goto :finish
     ) else if "%RC%"=="2" (
         echo User declined to install missing packages into ./deps.
-        set /p CONTINUE_WITHOUT=Continue without installing missing packages? [y/N] 
+        set /p CONTINUE_WITHOUT=Continue without installing missing packages? [y/N]
         if /I "%CONTINUE_WITHOUT%" NEQ "y" (
             echo Aborting per user request.
-            pause
-            exit /b 1
-        ) else (
-            echo Continuing without local installs. Note: scripts may fail if deps are missing.
+            set "RC=1"
+            goto :finish
         )
-    ) else (
-        echo Dependency check/installation complete.
     )
 ) else (
     echo Ensure_deps.py not found; skipping dependency auto-check.
@@ -49,7 +56,10 @@ if exist "%SCRIPT_DIR%Ensure_deps.py" (
 :: Optional: run empty layer checker if present
 if exist "%SCRIPT_DIR%CheckEmptyLayers.py" (
     echo Running CheckEmptyLayers.py...
-    "%PYTHON_CMD%" "%SCRIPT_DIR%CheckEmptyLayers.py"
+    call "%PYTHON_CMD%" -u "%SCRIPT_DIR%CheckEmptyLayers.py"
+    if errorlevel 1 (
+        echo CheckEmptyLayers.py returned an error; continuing.
+    )
 ) else (
     echo CheckEmptyLayers.py not detected; skipping it.
 )
@@ -57,83 +67,56 @@ if exist "%SCRIPT_DIR%CheckEmptyLayers.py" (
 :: Main exporter (exports .vox -> exported_meshes/<voxbasename>/)
 echo Running ExportMeshes.py...
 if exist "%SCRIPT_DIR%ExportMeshes.py" (
-    "%PYTHON_CMD%" "%SCRIPT_DIR%ExportMeshes.py"
+    call "%PYTHON_CMD%" -u "%SCRIPT_DIR%ExportMeshes.py"
+    if errorlevel 1 (
+        echo ExportMeshes.py failed.
+        set "RC=1"
+        goto :finish
+    )
 ) else (
     echo ExportMeshes.py not found; aborting.
-    pause
-    exit /b 1
+    set "RC=1"
+    goto :finish
+)
+
+:: Ensure FinalMapping reports exist (run FinalizeMapping once)
+if exist "%SCRIPT_DIR%FinalizeMapping.py" (
+    echo Running FinalizeMapping.py to generate FinalMapping reports...
+    call "%PYTHON_CMD%" -u "%SCRIPT_DIR%FinalizeMapping.py"
+    if errorlevel 1 (
+        echo FinalizeMapping.py reported errors; check reports\ for details.
+    )
+) else (
+    echo FinalizeMapping.py not found; skipping.
 )
 
 :: Optional: compare expected vs actual exports
 if exist "%SCRIPT_DIR%CompareExports.py" (
     echo Running CompareExports.py...
-    "%PYTHON_CMD%" "%SCRIPT_DIR%CompareExports.py"
+    call "%PYTHON_CMD%" -u "%SCRIPT_DIR%CompareExports.py"
 ) else (
     echo CompareExports.py not found; skipping file-compare step.
 )
 
-:: Optional diagnostics
+:: Print part assignments — run live so output appears in console immediately (no standalone runs required)
 if exist "%SCRIPT_DIR%PrintPartAssignments.py" (
-    echo Running PrintPartAssignments.py...
-    "%PYTHON_CMD%" "%SCRIPT_DIR%PrintPartAssignments.py"
+    echo Running PrintPartAssignments.py ^(live output^)...
+    call "%PYTHON_CMD%" -u "%SCRIPT_DIR%PrintPartAssignments.py"
+    echo PrintPartAssignments completed; report written to reports\PrintPartAssignments_*.txt
 ) else (
     echo PrintPartAssignments.py not found; skipping assignment diagnostic.
 )
 
-:: Run renamer (global assignment) if present
-if exist "%SCRIPT_DIR%RenameExportsByCentroid.py" (
-    echo Running RenameExportsByCentroid.py --commit...
-    "%PYTHON_CMD%" "%SCRIPT_DIR%RenameExportsByCentroid.py" --commit
-) else (
-    echo RenameExportsByCentroid.py not found; skipping rename step.
-)
+:: (Optional) Run RenameExportsByCentroid in dry-run if you want; disabled by default to avoid side-effects.
+:: if exist "%SCRIPT_DIR%RenameExportsByCentroid.py" (
+::     echo Running RenameExportsByCentroid.py (DRY-RUN)...
+::     call "%PYTHON_CMD%" -u "%SCRIPT_DIR%RenameExportsByCentroid.py"
+:: )
 
-:: Finalize mapping if present
-if exist "%SCRIPT_DIR%FinalizeMapping.py" (
-    echo Running FinalizeMapping.py...
-    "%PYTHON_CMD%" "%SCRIPT_DIR%FinalizeMapping.py"
-) else (
-    echo FinalizeMapping.py not found; skipping finalization.
-)
-
-:: Auto-generate and apply high-confidence overrides per .vox (dry-run then prompt)
-pushd "%SCRIPT_DIR%"
-if exist "AutoApplyOverrides.py" (
-    for %%F in (*.vox) do (
-        set "VOXNAME=%%~nF"
-        echo.
-        echo ===== Auto-suggest overrides for !VOXNAME! (dry-run, tiny->large heuristic enabled) =====
-        "%PYTHON_CMD%" "AutoApplyOverrides.py" --vox "!VOXNAME!" --enable-tiny2large
-        echo.
-
-        :: If consumer sets the env var AUTOAPPLY=1 the script will auto-commit without prompting.
-        if defined AUTOAPPLY (
-            echo AUTOAPPLY detected; applying high-confidence overrides for !VOXNAME! now...
-            "%PYTHON_CMD%" "AutoApplyOverrides.py" --vox "!VOXNAME!" --enable-tiny2large --auto
-            if errorlevel 1 (
-                echo Auto-commit failed for !VOXNAME!; check reports\ for details.
-            ) else (
-                echo Auto-commit successful for !VOXNAME!.
-            )
-        ) else (
-            set /p APPLY_NOW=Apply high-confidence overrides for !VOXNAME! now? [y/N] 
-            if /I "!APPLY_NOW!"=="y" (
-                echo Applying high-confidence overrides for !VOXNAME!...
-                "%PYTHON_CMD%" "AutoApplyOverrides.py" --vox "!VOXNAME!" --enable-tiny2large --auto
-                if errorlevel 1 (
-                    echo Auto-commit failed for !VOXNAME!; check reports\ for details.
-                ) else (
-                    echo Auto-commit successful for !VOXNAME!.
-                )
-            ) else (
-                echo Skipping auto-commit for !VOXNAME!.
-            )
-        )
-    )
-) else (
-    echo AutoApplyOverrides.py not found in %CD%; skipping auto-overrides step.
-)
-popd
-
-pause
+:finish
+echo.
+echo RunMagicaExport finished with RC=%RC%.
+echo Press any key to close this window...
+pause >nul
 endlocal
+exit /b %RC%

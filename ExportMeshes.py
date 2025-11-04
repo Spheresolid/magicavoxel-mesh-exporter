@@ -4,6 +4,7 @@ import sys
 import math
 import traceback
 import csv
+import glob
 
 import numpy as np
 import trimesh
@@ -132,6 +133,16 @@ for vox_file in vox_files:
     vox_name = os.path.splitext(vox_file)[0]
     sub_export_dir = os.path.join(EXPORT_ROOT, vox_name)
     os.makedirs(sub_export_dir, exist_ok=True)
+
+    # CLEANUP: remove existing .obj files to avoid accumulation across runs
+    try:
+        for old in glob.glob(os.path.join(sub_export_dir, "*.obj")):
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     try:
         parser = Vox200Parser(vox_path).parse()

@@ -1,5 +1,13 @@
+# -*- coding: utf-8 -*-
+"""
+PrintPartAssignments.py
+Stream parsed .vox layer assignments to stdout in real time and also
+write the same output incrementally to reports/PrintPartAssignments_<voxbasename>.txt.
+"""
 import os
+import sys
 import struct
+import argparse
 from collections import namedtuple
 
 Voxel = namedtuple("Voxel", ["x", "y", "z", "color_index"])
@@ -30,11 +38,13 @@ def parse_vox_layers_and_models(filepath):
             if chunk_id == b"LAYR":
                 layer_id = struct.unpack("<I", content[:4])[0]
                 offset = 4
+                attr_dict_len = 0
                 if offset + 4 <= len(content):
-                    attr_dict_len = struct.unpack("<I", content[offset:offset+4])[0]
+                    try:
+                        attr_dict_len = struct.unpack("<I", content[offset:offset+4])[0]
+                    except Exception:
+                        attr_dict_len = 0
                     offset += 4
-                else:
-                    attr_dict_len = 0
                 name = None
                 for _ in range(attr_dict_len):
                     if offset + 4 > len(content): break
@@ -61,7 +71,7 @@ def parse_vox_layers_and_models(filepath):
                     if i * 4 + 4 > len(voxel_data):
                         break
                     x, y, z, ci = struct.unpack("BBBB", voxel_data[i * 4:(i + 1) * 4])
-                    voxels.append((x,y,z,ci))
+                    voxels.append(Voxel(x, y, z, ci))
                 model_voxels[model_counter] = voxels
                 model_voxel_counts[model_counter] = len(voxels)
                 model_counter += 1
@@ -74,31 +84,78 @@ def parse_vox_layers_and_models(filepath):
 
     return model_voxels, ordered_layer_names, model_voxel_counts
 
+def stream_write(line, out_file=None):
+    """Write a line to stdout (unbuffered) and optionally to an open file object."""
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except Exception:
+        # best-effort: ignore console errors
+        pass
+    if out_file is not None:
+        try:
+            out_file.write(line + "\n")
+            out_file.flush()
+        except Exception:
+            pass
+
 def print_assignments(vox_path):
     model_voxels, ordered_layer_names, model_voxel_counts = parse_vox_layers_and_models(vox_path)
-    print(f"Parsed: {os.path.basename(vox_path)}")
-    print(f"Ordered LAYR names ({len(ordered_layer_names)}): {ordered_layer_names}\n")
+    vox_base = os.path.splitext(os.path.basename(vox_path))[0]
+    reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    report_path = os.path.join(reports_dir, f"PrintPartAssignments_{vox_base}.txt")
 
-    idx = 0
-    for model_id in sorted(model_voxels.keys()):
-        voxels = model_voxels[model_id]
-        if len(voxels) == 0:
-            print(f"model {model_id}: EMPTY -> skipped")
-            continue
-        if idx < len(ordered_layer_names):
-            name = ordered_layer_names[idx]
-        else:
-            name = f"Part_{model_id}"
-        safe = sanitize_filename(name)
-        print(f"model {model_id} -> raw Part_{model_id} -> assigned '{name}' -> file '{safe}.obj' -> {len(voxels)} voxels")
-        idx += 1
+    # Open report file for incremental writes
+    with open(report_path, "w", encoding="utf-8") as rep:
+        stream_write(f"Parsed: {os.path.basename(vox_path)}", rep)
+        stream_write(f"Ordered LAYR names ({len(ordered_layer_names)}): {ordered_layer_names}", rep)
+        stream_write("", rep)
 
-if __name__ == '__main__':
+        idx = 0
+        for model_id in sorted(model_voxels.keys()):
+            voxels = model_voxels[model_id]
+            if len(voxels) == 0:
+                stream_write(f"model {model_id}: EMPTY -> skipped", rep)
+                continue
+            if idx < len(ordered_layer_names):
+                name = ordered_layer_names[idx]
+            else:
+                name = f"Part_{model_id}"
+            safe = sanitize_filename(name)
+            line = f"model {model_id} -> raw Part_{model_id} -> assigned '{name}' -> file '{safe}.obj' -> {len(voxels)} voxels"
+            stream_write(line, rep)
+            idx += 1
+
+        stream_write("", rep)
+        stream_write(f"[INFO] Wrote assignment report: {report_path}", rep)
+
+def main():
+    p = argparse.ArgumentParser(description="Print part assignments for a .vox file (live stream and report).")
+    p.add_argument("--vox", help="Optional: vox basename (no extension). If omitted, picks Character.vox if present, else first .vox.")
+    args = p.parse_args()
+
     base = os.path.dirname(__file__)
     vox_files = [f for f in os.listdir(base) if f.lower().endswith('.vox')]
     if not vox_files:
-        print("No .vox files found in folder.")
+        stream_write("No .vox files found.")
+        return 0
+
+    if args.vox:
+        target = f"{args.vox}.vox"
+        if target not in vox_files:
+            stream_write(f"Specified vox not found: {args.vox}")
+            return 1
+        vox_choice = target
     else:
-        # choose Character.vox explicitly if present
-        target = 'Character.vox' if 'Character.vox' in vox_files else vox_files[0]
-        print_assignments(os.path.join(base, target))
+        vox_choice = 'Character.vox' if 'Character.vox' in vox_files else vox_files[0]
+
+    try:
+        print_assignments(os.path.join(base, vox_choice))
+    except Exception as ex:
+        stream_write(f"[ERROR] Failed to parse {vox_choice}: {ex}")
+        return 2
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

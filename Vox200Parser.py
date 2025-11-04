@@ -9,7 +9,8 @@ class Vox200Parser:
     def __init__(self, filepath):
         self.filepath = filepath
         self.voxels_by_layer = defaultdict(list)
-        self.layer_name_map = {}           # Final mapping: raw_key -> descriptive name
+        self.layer_name_map = {}           # Final mapping: raw_key -> descriptive name (for non-empty parts)
+        self.raw_part_name_map = {}        # New: mapping for every Part_X (including empty/helper parts)
         self.layer_id_to_name = {}         # LAYR chunk: layer_id -> name
         self.layer_ids_in_order = []       # keep LAYR order as seen in file
         self.node_id_to_name = {}          # nTRN / nSHP: node_id or model_id -> name
@@ -231,64 +232,108 @@ class Vox200Parser:
                 chosen = None
                 reason = None
 
-                # 1) model -> shape node -> prefer transform node name if that transform points to a shape that has voxels
+                # 1) model -> shape node
                 shape_node = self.model_id_to_shape.get(model_idx)
                 if shape_node is not None:
                     # find transform nodes that point to this shape (node_to_child)
                     transform_nodes = [tn for tn, child in self.node_to_child.items() if child == shape_node]
                     if transform_nodes:
-                        # prefer a transform node name that looks usable and maps to voxel-containing shape
+                        # prefer a transform node name
                         for tn in transform_nodes:
                             tn_name = self.node_id_to_name.get(tn)
-                            if tn_name and (not self._looks_like_helper(tn_name)) and shape_has_vox.get(shape_node, False):
+                            if tn_name:
                                 chosen = tn_name
                                 reason = f"nTRN name from transform node {tn} (points to shape {shape_node})"
                                 break
-                        # if no tn name usable, try transform->layer->LAYR if that layer name looks usable
+                        # if no tn name, try transform->layer->LAYR
                         if not chosen:
                             for tn in transform_nodes:
                                 layer_id = self.node_to_layer.get(tn)
                                 if layer_id is not None:
                                     layr_name = self.layer_id_to_name.get(layer_id)
-                                    if layr_name and (not self._looks_like_helper(layr_name)):
+                                    if layr_name:
                                         chosen = layr_name
                                         reason = f"LAYR name via transform node {tn} -> layer {layer_id}"
                                         break
 
-                # 2) direct shape node name if shape has voxels and name is usable
+                # 2) direct shape node name
                 if not chosen:
                     shape_named = self.node_id_to_name.get(shape_node)
-                    if shape_named and (not self._looks_like_helper(shape_named)) and shape_has_vox.get(shape_node, False):
+                    if shape_named:
                         chosen = shape_named
                         reason = f"nSHP / shape node name for shape {shape_node}"
 
-                # 3) fallback to LAYR mapping by ordered non-empty index (previous behavior) but ensure it's usable
+                # 3) fallback to LAYR mapping by ordered non-empty index (previous behavior)
                 if not chosen:
+                    # use the idx'th ordered_layer_names if available
                     if idx < len(ordered_layer_names):
-                        layr_try = ordered_layer_names[idx]
-                        if layr_try and (not self._looks_like_helper(layr_try)):
-                            chosen = layr_try
-                            reason = f"LAYR order fallback index {idx}"
-                        else:
-                            chosen = None
+                        chosen = ordered_layer_names[idx]
+                        reason = f"LAYR order fallback index {idx}"
+                    else:
+                        chosen = raw_key
+                        reason = "fallback raw key"
 
-                # 4) Last resort: fallback to raw_key
-                if not chosen:
-                    chosen = raw_key
-                    reason = "fallback raw key"
-
-                # sanitize and ensure uniqueness: append _1, _2... if name already used
-                safe = self._sanitize_name(str(chosen)) or raw_key
-                base = safe
-                suffix = 1
-                while safe in used_names:
-                    safe = f"{base}_{suffix}"
-                    suffix += 1
-                used_names.add(safe)
-
-                final_map[raw_key] = safe
+                final_map[raw_key] = chosen
 
             self.layer_name_map = final_map
+
+            # --- NEW: populate raw_part_name_map for every Part_X (including empty/helper parts) ---
+            # Determine full set of model indices we can reason about:
+            all_model_indices = set(model_indices_with_vox)
+            all_model_indices.update(self.model_id_to_shape.keys())
+            # Also include any Part_ keys present in voxels_by_layer even if empty (defensive)
+            for raw_k in list(self.voxels_by_layer.keys()):
+                try:
+                    i = int(raw_k.split("_",1)[1])
+                    all_model_indices.add(i)
+                except Exception:
+                    pass
+
+            raw_map = {}
+            for model_idx in sorted(all_model_indices):
+                raw_key = f"Part_{model_idx}"
+                chosen = None
+
+                # 1) model -> shape node
+                shape_node = self.model_id_to_shape.get(model_idx)
+                if shape_node is not None:
+                    transform_nodes = [tn for tn, child in self.node_to_child.items() if child == shape_node]
+                    if transform_nodes:
+                        for tn in transform_nodes:
+                            tn_name = self.node_id_to_name.get(tn)
+                            if tn_name:
+                                chosen = tn_name
+                                break
+                        if not chosen:
+                            for tn in transform_nodes:
+                                layer_id = self.node_to_layer.get(tn)
+                                if layer_id is not None:
+                                    layr_name = self.layer_id_to_name.get(layer_id)
+                                    if layr_name:
+                                        chosen = layr_name
+                                        break
+
+                # 2) direct shape node name
+                if not chosen:
+                    shape_named = self.node_id_to_name.get(shape_node)
+                    if shape_named:
+                        chosen = shape_named
+
+                # 3) fallback to LAYR ordered names by model index if possible
+                if not chosen:
+                    if model_idx < len(ordered_layer_names):
+                        chosen = ordered_layer_names[model_idx]
+                    else:
+                        # last resort: if this part had voxels, prefer the previously computed final_map entry
+                        if raw_key in final_map:
+                            chosen = final_map[raw_key]
+                        else:
+                            chosen = raw_key
+
+                raw_map[raw_key] = chosen
+
+            self.raw_part_name_map = raw_map
+            # --- END NEW population ---
 
             # Write detailed DebugNameMap_<voxname>.txt in reports/
             try:
@@ -318,7 +363,7 @@ class Vox200Parser:
                     f.write("Shape Node -> Model IDs (nSHP):\n")
                     if self.shape_node_to_models:
                         for sid, models in sorted(self.shape_node_to_models.items()):
-                            f.write(f"  ShapeNode {sid} => Models: {models}  has_vox={shape_has_vox.get(sid, False)}\n")
+                            f.write(f"  ShapeNode {sid} => Models: {models}\n")
                     else:
                         f.write("  (no shape->model mappings found)\n")
                     f.write("\n")
@@ -326,7 +371,7 @@ class Vox200Parser:
                     f.write("Transform Node -> Child Node (nTRN):\n")
                     if self.node_to_child:
                         for tn, child in sorted(self.node_to_child.items()):
-                            f.write(f"  TransformNode {tn} => ChildNode {child}  name={self.node_id_to_name.get(tn)}  layer={self.node_to_layer.get(tn)}\n")
+                            f.write(f"  TransformNode {tn} => ChildNode {child}\n")
                     else:
                         f.write("  (no transform->child mappings found)\n")
                     f.write("\n")
@@ -339,8 +384,14 @@ class Vox200Parser:
                         f.write("  (no transform->layer mappings found)\n")
                     f.write("\n")
 
-                    f.write("Final assignment (Part_X -> chosen name):\n")
+                    f.write("Final assignment (Part_X -> chosen name) for non-empty parts (layer_name_map):\n")
                     for raw_key, chosen in self.layer_name_map.items():
+                        count = len(self.voxels_by_layer.get(raw_key, []))
+                        f.write(f"  {raw_key} ({count} voxels) => {chosen}\n")
+                    f.write("\n")
+
+                    f.write("Raw part name map (all Part_X keys, including empty/helper parts):\n")
+                    for raw_key, chosen in sorted(self.raw_part_name_map.items()):
                         count = len(self.voxels_by_layer.get(raw_key, []))
                         f.write(f"  {raw_key} ({count} voxels) => {chosen}\n")
 
