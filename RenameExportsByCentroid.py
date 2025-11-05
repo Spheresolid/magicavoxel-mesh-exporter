@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+"""
+RenameExportsByCentroid.py
+Final renamer (safe, surgical):
+- Transfer descriptive names from tiny helper parts to the most appropriate large winner.
+- Prioritize high-value donors (head/eyes/face) and tiny donors, so important names are assigned first.
+- Winners sorted by size (largest first). Very large winners may waive centroid distance checks.
+- Dry-run by default; --commit performs two-phase safe renames with backups.
+"""
 import os
 import glob
 import shutil
@@ -21,11 +29,15 @@ EXPORT_ROOT = os.path.join(BASE_DIR, "exported_meshes")
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-parser_arg = argparse.ArgumentParser(description="Rename exported .obj files to match parser intent by global assignment.")
+parser_arg = argparse.ArgumentParser(description="Rename exported .obj files to match parser intent by safe helper->large transfers.")
 parser_arg.add_argument("--commit", action="store_true", help="Perform renames (default is dry-run). Backups are created for overwritten files.")
 parser_arg.add_argument("--vox", help="Optional: limit to a single .vox basename (no extension).")
-parser_arg.add_argument("--count-weight", type=float, default=0.5, help="Weight for voxel-count penalty relative to centroid distance (default 0.5)")
-parser_arg.add_argument("--iou-weight", type=float, default=1.0, help="Weight for AABB IoU penalty (1 - IoU) (default 1.0)")
+parser_arg.add_argument("--suspect-threshold", type=int, default=10, help="Max voxel count for a part to be considered a suspect helper (default 10).")
+parser_arg.add_argument("--size-ratio-threshold", type=float, default=4.0, help="Required ratio between winning part and suspect donor (default 4.0).")
+parser_arg.add_argument("--centroid-threshold", type=float, default=10.0, help="Max centroid distance for non-essential transfers (default 10.0).")
+parser_arg.add_argument("--name-trust-threshold", type=int, default=100, help="If winning part is larger than this, it is trusted and can claim any name (default 100).")
+parser_arg.add_argument("--debug", action="store_true", help="Emit debug claim info to console and include in report")
+
 args = parser_arg.parse_args()
 
 def backup_path(path):
@@ -45,11 +57,10 @@ def read_exportlog_counts(export_dir):
                 line = line.strip()
                 if line.lower().startswith("exported"):
                     try:
-                        # Find the filename and the voxel count
                         parts = line.split("as", 1)[1].strip()
                         filename = parts.split(" (source=", 1)[0].split()[0]
-                        count_match = re.search(r'\((\d+)\s+voxels\)', line)
-                        count = int(count_match.group(1)) if count_match else 0
+                        m = re.search(r'\((\d+)\s+voxels\)', line)
+                        count = int(m.group(1)) if m else 0
                         out[filename] = count
                     except Exception:
                         continue
@@ -57,8 +68,31 @@ def read_exportlog_counts(export_dir):
         pass
     return out
 
+def aabb_iou(min_a, max_a, min_b, max_b):
+    inter_min = np.maximum(min_a, min_b)
+    inter_max = np.minimum(max_a, max_b)
+    inter_dims = np.maximum(inter_max - inter_min, 0.0)
+    inter_vol = inter_dims[0] * inter_dims[1] * inter_dims[2]
+    vol_a = np.prod(np.maximum(max_a - min_a, 0.0))
+    vol_b = np.prod(np.maximum(max_b - min_b, 0.0))
+    union = vol_a + vol_b - inter_vol
+    if union <= 0.0:
+        return 0.0
+    return float(inter_vol / union)
+
+def looks_descriptive(name):
+    if not name:
+        return False
+    s = str(name).strip()
+    if len(s) <= 2:
+        return False
+    if re.fullmatch(r'^\d+$', s):  # numeric-only
+        return False
+    if len(s) <= 3 and any(c.isdigit() for c in s):
+        return False
+    return True
+
 def try_hungarian(cost_matrix):
-    """Try to use scipy's Hungarian; return row_ind, col_ind or None if not available."""
     try:
         from scipy.optimize import linear_sum_assignment
         r, c = linear_sum_assignment(cost_matrix)
@@ -67,16 +101,11 @@ def try_hungarian(cost_matrix):
         return None
 
 def greedy_with_pairwise_improvement(cost):
-    """
-    Pure-Python fallback for assignment problem.
-    """
     n_rows, n_cols = cost.shape
     rows = list(range(n_rows))
     cols = list(range(n_cols))
     assigned_cols = set()
     assignment = [-1] * n_rows
-
-    # Greedy: for each row, pick nearest available column (smallest cost)
     for r in rows:
         col_order = sorted(cols, key=lambda c: cost[r, c])
         chosen = None
@@ -87,7 +116,6 @@ def greedy_with_pairwise_improvement(cost):
         if chosen is not None:
             assignment[r] = chosen
             assigned_cols.add(chosen)
-            
     unused_cols = [c for c in cols if c not in assigned_cols]
     for i, a in enumerate(assignment):
         if a == -1:
@@ -95,7 +123,6 @@ def greedy_with_pairwise_improvement(cost):
                 assignment[i] = unused_cols.pop(0)
             else:
                 assignment[i] = None
-
     def total_cost(assign):
         s = 0.0
         for i, c in enumerate(assign):
@@ -104,8 +131,6 @@ def greedy_with_pairwise_improvement(cost):
             else:
                 s += cost[i, c]
         return s
-
-    # Pairwise improvement
     current_cost = total_cost(assignment)
     improved = True
     while improved:
@@ -127,96 +152,85 @@ def greedy_with_pairwise_improvement(cost):
                     break
             if improved:
                 break
-
     row_idx = [i for i in range(len(assignment))]
     col_idx = [assignment[i] if assignment[i] is not None else -1 for i in range(len(assignment))]
     return row_idx, col_idx
 
-def aabb_iou(min_a, max_a, min_b, max_b):
-    # min_*/max_* are numpy arrays
-    inter_min = np.maximum(min_a, min_b)
-    inter_max = np.minimum(max_a, max_b)
-    inter_dims = np.maximum(inter_max - inter_min, 0.0)
-    inter_vol = inter_dims[0] * inter_dims[1] * inter_dims[2]
-    vol_a = np.prod(np.maximum(max_a - min_a, 0.0))
-    vol_b = np.prod(np.maximum(max_b - min_b, 0.0))
-    union = vol_a + vol_b - inter_vol
-    if union <= 0.0:
-        return 0.0
-    return float(inter_vol / union)
-
-# --- NAME CLAIMING FUNCTION (patched) ---
-def find_canonical_name(raw_key, parser, current_centroid, current_count, max_dist_norm, max_count_norm):
+def transfer_suspect_names(parser, model_centroids, model_counts):
     """
-    Enhanced logic:
-    - Prefer parser's explicit non-generic name when it's reasonable (not suspicious).
-    - If the parser-assigned name is non-generic but the part is suspiciously small, allow claiming.
-    - Otherwise fall back to scanning parser.raw_part_name_map for nearby descriptive names.
+    Transfer descriptive names from tiny donors to the best large winners.
+    Priority:
+      1) donor ordering: high-value tokens (head/eyes/face) first, then smaller donors first
+      2) winners ordered by size (largest first); first winner that satisfies size ratio
+         and distance (or is trusted) wins.
+    Returns: dict {winner_raw_key: donor_name}
     """
-    # Parameters
-    SUSPECT_VOXEL_THRESHOLD = 10  # parts smaller than this are suspicious even if named
+    suspect_names = {}    # donor_name -> donor_raw_key
+    trusted_winners = {}  # winner_raw_key -> current_name
 
-    # Prefer the parser's explicit layer-name assignment when available
-    current_name = parser.layer_name_map.get(raw_key)
-    if current_name:
-        # If assigned name is non-generic and the part is reasonably large, trust it
-        if not str(current_name).startswith("Part_") and (current_count is not None and current_count >= SUSPECT_VOXEL_THRESHOLD):
-            return current_name
-        # If assigned name is generic, proceed to claim logic below
-        # If assigned name is non-generic but the part is suspiciously small, allow claiming
-    else:
-        current_name = raw_key
-
-    # Extract numeric index from raw_key (e.g., 'Part_12' -> 12). If not found, bail out.
-    m_raw = re.search(r'Part_(\d+)', raw_key)
-    if not m_raw:
-        return current_name
-    try:
-        raw_idx = int(m_raw.group(1))
-    except Exception:
-        return current_name
-
-    # Scan helper/raw part name map for clean names with nearby indices
-    best_candidate = None
-    best_score = None
-    for helper_key, helper_name in parser.raw_part_name_map.items():
-        if not helper_name:
+    # collect donors and winners
+    for raw_key, name in parser.raw_part_name_map.items():
+        if not looks_descriptive(name):
             continue
-        # Skip generic helper names
-        if str(helper_name).startswith("Part_"):
+        count = model_counts.get(raw_key, 0)
+        if count <= args.suspect_threshold:
+            suspect_names[name] = raw_key
+        elif count > args.suspect_threshold:
+            trusted_winners[raw_key] = name
+
+    if not suspect_names or not trusted_winners:
+        return {}
+
+    # donor ordering: high-value tokens first, then small counts
+    def donor_sort_key(item):
+        name, key = item
+        nl = name.lower()
+        priority = 0 if any(tok in nl for tok in ("head", "eyes", "face")) else 1
+        cnt = model_counts.get(key, 0)
+        return (priority, cnt)
+    donor_items = sorted(list(suspect_names.items()), key=donor_sort_key)
+
+    # winners sorted by descending size
+    sorted_winners = sorted(trusted_winners.keys(), key=lambda k: model_counts.get(k, 0), reverse=True)
+
+    transfers = {}
+    claimed = set()
+
+    for donor_name, donor_key in donor_items:
+        if donor_name in claimed:
             continue
-        m_helper = re.search(r'Part_(\d+)', helper_key)
-        if not m_helper:
-            continue
-        try:
-            helper_idx = int(m_helper.group(1))
-        except Exception:
+        donor_count = model_counts.get(donor_key, 0)
+        donor_centroid = model_centroids.get(donor_key)
+        if donor_centroid is None:
             continue
 
-        # distance metric: prefer smaller index distance and larger helper part count (if available)
-        idx_dist = abs(helper_idx - raw_idx)
-        helper_count = None
-        try:
-            helper_count = len(parser.voxels_by_layer.get(helper_key, []))
-        except Exception:
-            helper_count = None
+        for winner_key in sorted_winners:
+            if winner_key in transfers:
+                continue
+            winner_count = model_counts.get(winner_key, 0)
+            # size ratio requirement
+            if winner_count < math.ceil(args.size_ratio_threshold * max(1, donor_count)):
+                continue
+            winner_centroid = model_centroids.get(winner_key)
+            if winner_centroid is None:
+                continue
+            dist = float(np.linalg.norm(winner_centroid - donor_centroid))
+            # distance check unless winner is trusted (very large)
+            max_dist_check = args.centroid_threshold
+            if winner_count >= args.name_trust_threshold:
+                max_dist_check = float("inf")
+            if dist > max_dist_check:
+                if args.debug:
+                    print(f"[DEBUG] donor {donor_key} '{donor_name}' skip {winner_key} dist {dist:.2f} > {max_dist_check:.2f}")
+                continue
+            # winner passes checks — because winners are sorted by size, accept immediately
+            transfers[winner_key] = donor_name
+            claimed.add(donor_name)
+            if args.debug:
+                print(f"[TRANSFER] donor {donor_key} (count={donor_count}) -> winner {winner_key} (count={winner_count}) name='{donor_name}' dist={dist:.2f}")
+            break
 
-        # score: lower is better; favor closer index and larger count
-        score = idx_dist - (0.01 * (helper_count or 0))
-        if best_score is None or score < best_score:
-            best_score = score
-            best_candidate = (helper_key, helper_name, helper_count, idx_dist)
-
-    # If we found a candidate within a small index window, prefer it
-    if best_candidate:
-        helper_key, helper_name, helper_count, idx_dist = best_candidate
-        # Only claim if close enough (index within 3) OR helper count is much larger than current
-        if idx_dist <= 3 or (helper_count is not None and current_count is not None and helper_count >= 4 * max(1, current_count)):
-            return helper_name
-
-    # Nothing better found — return the original (possibly suspicious) name
-    return current_name
-# --- END NAME CLAIMING PATCH ---
+    return transfers
 
 # Main
 vox_files = [f for f in os.listdir(BASE_DIR) if f.lower().endswith(".vox")]
@@ -239,21 +253,31 @@ for vox_file in vox_files:
         print(f"Processing: {vox_file}")
 
         parser = Vox200Parser(vox_path).parse()
-        voxels_by_layer = parser.voxels_by_layer         # dict 'Part_X' -> list of Voxels
-        name_map = parser.layer_name_map                 # 'Part_X' -> intended name (for non-empty parts)
+        voxels_by_layer = parser.voxels_by_layer
+        layer_name_map = parser.layer_name_map
+        raw_name_map = parser.raw_part_name_map
         model_keys = [k for k in voxels_by_layer.keys() if len(voxels_by_layer[k]) > 0]
+
+        # per-part stats
         model_centroids = {}
         model_counts = {}
+        model_aabbs = {}
         for raw_key in model_keys:
-            voxels = voxels_by_layer[raw_key]
-            pts = np.array([[v.x, v.y, v.z] for v in voxels], dtype=float)
+            vox = voxels_by_layer[raw_key]
+            pts = np.array([[v.x, v.y, v.z] for v in vox], dtype=float)
             model_centroids[raw_key] = pts.mean(axis=0)
-            model_counts[raw_key] = len(voxels)
+            model_counts[raw_key] = len(vox)
+            model_aabbs[raw_key] = (pts.min(axis=0), pts.max(axis=0))
 
+        # compute transfers
+        transfers = transfer_suspect_names(parser, model_centroids, model_counts)
+        transfers_debug = []
+        for k, v in transfers.items():
+            transfers_debug.append(f"[TRANSFER_ASSIGNED] {k} => '{v}'")
+
+        # locate exported OBJ files
         exported_dir = os.path.join(EXPORT_ROOT, vox_base)
         exported_paths = sorted(glob.glob(os.path.join(exported_dir, "*.obj")))
-        
-        # --- ROBUST REPORTING CHECK ---
         report_path = os.path.join(REPORTS_DIR, f"RenamingReport_{vox_base}.txt")
         manifest_path = os.path.join(REPORTS_DIR, f"RenamingManifest_{vox_base}.json")
 
@@ -265,24 +289,20 @@ for vox_file in vox_files:
             with open(report_path, "w", encoding="utf-8") as rep:
                 rep.write(f"RenamingReport (skipped) for: {vox_file}\n\n")
                 rep.write(f"SKIPPED: No exported .obj files found in {exported_dir}.\n")
-            
             print(f"  Report written: {report_path} (SKIPPED)")
             print(f"  Manifest written: {manifest_path} (SKIPPED)")
             continue
-        # --- END ROBUST REPORTING CHECK ---
 
         exported_centroids = {}
         exported_mesh_counts = {}
         file_aabbs = {}
-        # Geometry data extraction must be inside a try-except for safety
         for p in exported_paths:
             try:
                 m = trimesh.load(p, force='mesh')
                 c = np.array(m.centroid if hasattr(m, "centroid") else np.array(m.bounds).mean(axis=0), dtype=float)
                 exported_centroids[p] = c
                 file_aabbs[p] = (m.bounds[0].astype(float), m.bounds[1].astype(float))
-            except Exception as e:
-                print(f"  WARNING: Failed to process OBJ {os.path.basename(p)}: {e}")
+            except Exception:
                 exported_centroids[p] = np.array([math.inf, math.inf, math.inf], dtype=float)
                 file_aabbs[p] = (np.array([math.inf, math.inf, math.inf], dtype=float), np.array([-math.inf, -math.inf, -math.inf], dtype=float))
 
@@ -300,14 +320,7 @@ for vox_file in vox_files:
             else:
                 exported_mesh_counts[p] = ccount if ccount is not None else 0
 
-        # compute model AABBs
-        model_aabbs = {}
-        for mk in model_keys:
-            voxels = voxels_by_layer[mk]
-            pts = np.array([[v.x, v.y, v.z] for v in voxels], dtype=float)
-            model_aabbs[mk] = (pts.min(axis=0), pts.max(axis=0))
-
-        # Build cost matrix rows = models, cols = exported files
+        # cost matrix (models x files)
         models = model_keys
         files = exported_paths
         R = len(models)
@@ -315,7 +328,6 @@ for vox_file in vox_files:
         N = max(R, C)
         cost = np.full((N, N), fill_value=1e6, dtype=float)
 
-        # compute raw distances and count diffs for normalization
         dists = []
         count_diffs = []
         for i, mk in enumerate(models):
@@ -326,14 +338,11 @@ for vox_file in vox_files:
 
         max_dist = max(dists) if dists else 1.0
         max_count = max(count_diffs) if count_diffs else 1.0
-        if max_dist == 0:
-            max_dist = 1.0
-        if max_count == 0:
-            max_count = 1.0
+        if max_dist == 0: max_dist = 1.0
+        if max_count == 0: max_count = 1.0
 
-        beta = float(args.count_weight)  # weight for count penalty
-        gamma = float(args.iou_weight)    # weight for IoU penalty (1 - IoU)
-
+        beta = 0.5
+        gamma = 1.0
         for i, mk in enumerate(models):
             for j, fp in enumerate(files):
                 dist = np.linalg.norm(model_centroids[mk] - exported_centroids[fp])
@@ -346,62 +355,41 @@ for vox_file in vox_files:
                 cost_val = dist_norm + beta * count_norm + gamma * iou_penalty
                 cost[i, j] = cost_val
 
-        # Solve assignment
-        assignment_rows, assignment_cols = None, None
         hung = try_hungarian(cost)
         if hung is not None:
             r_idx, c_idx = hung
-            assignment_rows = list(range(N))
             assignment_cols = [-1] * N
             for r, c in zip(r_idx, c_idx):
                 assignment_cols[r] = c
         else:
             r_idx, c_idx = greedy_with_pairwise_improvement(cost)
-            assignment_rows = r_idx
             assignment_cols = c_idx
 
-        # Build assignment mapping for actual model keys only
-        assignment = {}  # raw_key -> (file_path, cost)
+        assignment = {}
         for i, mk in enumerate(models):
             col = assignment_cols[i] if i < len(assignment_cols) else -1
             if col is None or col < 0 or col >= len(files):
                 continue
             assignment[mk] = (files[col], float(cost[i, col]))
 
-        # For any models left unassigned but files remain, try greedy fill (PRESERVED)
-        assigned_files = set(v[0] for v in assignment.values())
-        remaining_files = [f for f in files if f not in assigned_files]
-        remaining_models = [m for m in models if m not in assignment]
-        for mk in remaining_models:
-            if not remaining_files:
-                break
-            best_f = None
-            best_d = None
-            for fp in remaining_files:
-                d = np.linalg.norm(model_centroids[mk] - exported_centroids[fp])
-                if best_d is None or d < best_d:
-                    best_d = d
-                    best_f = fp
-            if best_f:
-                assignment[mk] = (best_f, float(best_d))
-                remaining_files.remove(best_f)
-
-        # Now build rename plan
+        # Build rename plan (transfers take precedence)
         rename_plan = []
         used_targets = set()
         manifest = {"vox": vox_file, "timestamp": datetime.datetime.now().isoformat(), "renames": []}
 
         for raw_key, (exp_path, dist) in assignment.items():
-            
-            # --- CORE LOGICAL FIX: DECOUPLE NAME FROM PARSER'S FLAWED MAP ---
-            intended_name = find_canonical_name(raw_key, parser, model_centroids.get(raw_key), model_counts.get(raw_key), max_dist, max_count)
-            # --- END FIX ---
+            intended_name = transfers.get(raw_key)
+            if not intended_name:
+                pname = layer_name_map.get(raw_key)
+                if pname and not str(pname).startswith("Part_"):
+                    intended_name = pname
+            if not intended_name:
+                intended_name = raw_key
 
             safe = sanitize_filename(intended_name) or raw_key
             target_filename = f"{safe}.obj"
             target_path = os.path.join(exported_dir, target_filename)
 
-            # If same file, no-op
             if os.path.abspath(exp_path) == os.path.abspath(target_path):
                 used_targets.add(target_path)
                 manifest["renames"].append({"src": os.path.basename(exp_path), "dst": os.path.basename(target_path), "backup": None, "distance": dist})
@@ -413,24 +401,30 @@ for vox_file in vox_files:
 
             if target_path in used_targets:
                 base, ext = os.path.splitext(target_filename)
-                idx = 1
+                idxdup = 1
                 while True:
-                    alt = f"{base}_{idx}{ext}"
+                    alt = f"{base}_{idxdup}{ext}"
                     alt_path = os.path.join(exported_dir, alt)
                     if not os.path.exists(alt_path) and alt_path not in used_targets:
                         target_path = alt_path
                         target_filename = alt
                         break
-                    idx += 1
+                    idxdup += 1
 
             used_targets.add(target_path)
             rename_plan.append((exp_path, target_path, bkp, raw_key, intended_name, dist))
             manifest["renames"].append({"src": os.path.basename(exp_path), "dst": os.path.basename(target_path), "backup": os.path.basename(bkp) if bkp else None, "distance": dist})
 
-        # Write report and manifest (dry-run content)
+        # Write report & manifest
         with open(report_path, "w", encoding="utf-8") as rep:
             rep.write(f"RenamingReport (dry-run={not args.commit}) for: {vox_file}\n\n")
-            rep.write("Assignments (raw_key -> exported_file, distance):\n")
+            rep.write("Transfers (surgical):\n")
+            if transfers_debug:
+                for ln in transfers_debug:
+                    rep.write("  " + ln + "\n")
+            else:
+                rep.write("  (none)\n")
+            rep.write("\nAssignments (raw_key -> exported_file, distance):\n")
             for raw_key, (exp_path, dist) in assignment.items():
                 rep.write(f"  {raw_key} -> {os.path.basename(exp_path)}  dist={dist}\n")
             rep.write("\nPlanned renames:\n")
@@ -439,60 +433,56 @@ for vox_file in vox_files:
                 if bkp:
                     rep.write(f"  [will backup existing {os.path.basename(tgt)} -> {os.path.basename(bkp)}]")
                 rep.write("\n")
-            rep.write("\nManifest file written next to this report for automatic undo.\n")
 
         with open(manifest_path, "w", encoding="utf-8") as mf:
             json.dump(manifest, mf, indent=2)
+
+        if args.debug and transfers_debug:
+            print("\n[CLAIM DEBUG]")
+            for ln in transfers_debug:
+                print(" ", ln)
 
         print(f"  Report written: {report_path}")
         print(f"  Manifest written: {manifest_path}")
         if not rename_plan:
             print("  Nothing to rename.")
-            
-        # Perform renames when --commit provided (two-phase safe rename)
-        if args.commit:
-            temp_map = []
-            try:
-                # Phase 1: move sources to temps
-                for cur, tgt, bkp, raw_key, intended, dist in rename_plan:
-                    cur_abs = os.path.abspath(cur)
-                    tgt_abs = os.path.abspath(tgt)
-                    if not os.path.exists(cur_abs):
-                        with open(report_path, "a", encoding="utf-8") as rep:
-                            rep.write(f"\nERROR: source not found (skipping): {cur_abs}\n")
-                        print(f"  ERROR: source not found (skipping): {cur_abs}")
-                        continue
-                    if cur_abs == tgt_abs:
-                        temp_map.append((None, tgt_abs, None, cur))
-                        continue
-                    tmp_name = f".tmp_rename_{uuid.uuid4().hex}.obj"
-                    tmp_path = os.path.join(exported_dir, tmp_name)
-                    shutil.move(cur_abs, tmp_path)
-                    temp_map.append((tmp_path, tgt_abs, bkp, cur))
-                # Phase 2: apply backups and move temps to final targets
-                for tmp_path, final_tgt, backup_for, original_src in temp_map:
-                    if tmp_path is None:
-                        continue
-                    if os.path.exists(final_tgt):
-                        bkp_path = backup_path(final_tgt)
-                        shutil.move(final_tgt, bkp_path)
-                        src_name = os.path.basename(original_src)
-                        for m in manifest["renames"]:
-                            if m["src"] == src_name:
-                                m["backup"] = os.path.basename(bkp_path)
-                                break
-                    shutil.move(tmp_path, final_tgt)
-                # Save manifest after actual moves
-                with open(manifest_path, "w", encoding="utf-8") as mf:
-                    json.dump(manifest, mf, indent=2)
-                print(f"  Completed renames (backups created for overwritten files). See {report_path}")
-            except Exception as ex:
-                with open(report_path, "a", encoding="utf-8") as rep:
-                    rep.write(f"\nERROR during rename operation: {ex}\n")
-                print(f"  ERROR during rename operation: {ex}")
         else:
-            print("  Dry-run only. Re-run with --commit to apply renames (backups will be created for overwritten files).")
-            
+            if args.commit:
+                temp_map = []
+                try:
+                    for cur, tgt, bkp, raw_key, intended, dist in rename_plan:
+                        cur_abs = os.path.abspath(cur)
+                        tgt_abs = os.path.abspath(tgt)
+                        if not os.path.exists(cur_abs):
+                            print(f"  ERROR: source not found (skipping): {cur_abs}")
+                            continue
+                        if cur_abs == tgt_abs:
+                            temp_map.append((None, tgt_abs, None, cur))
+                            continue
+                        tmp_name = f".tmp_rename_{uuid.uuid4().hex}.obj"
+                        tmp_path = os.path.join(exported_dir, tmp_name)
+                        shutil.move(cur_abs, tmp_path)
+                        temp_map.append((tmp_path, tgt_abs, bkp, cur))
+                    for tmp_path, final_tgt, backup_for, original_src in temp_map:
+                        if tmp_path is None:
+                            continue
+                        if os.path.exists(final_tgt):
+                            bkp_path = backup_path(final_tgt)
+                            shutil.move(final_tgt, bkp_path)
+                            src_name = os.path.basename(original_src)
+                            for m in manifest["renames"]:
+                                if m["src"] == src_name:
+                                    m["backup"] = os.path.basename(bkp_path)
+                                    break
+                        shutil.move(tmp_path, final_tgt)
+                    with open(manifest_path, "w", encoding="utf-8") as mf:
+                        json.dump(manifest, mf, indent=2)
+                    print(f"  Completed renames (backups created for overwritten files). See {report_path}")
+                except Exception as ex:
+                    print(f"  ERROR during rename operation: {ex}")
+            else:
+                print("  Dry-run only. Re-run with --commit to apply renames (backups will be created for overwritten files).")
+
     except Exception as ex:
         print(f"\n[FATAL ERROR]: An unhandled exception occurred during processing of {vox_file}:")
         print(ex)

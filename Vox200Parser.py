@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import struct
 import re
@@ -123,8 +124,8 @@ class Vox200Parser:
                     # Some exporters put layer_id further in the content (heuristic)
                     try:
                         if len(content) >= 28:
+                            # store the raw integer seen in the chunk; interpretation will be resolved later
                             layer_candidate = struct.unpack("<I", content[24:28])[0]
-                            # store only if plausible (non-negative)
                             self.node_to_layer[node_id] = layer_candidate
                     except Exception:
                         pass
@@ -216,6 +217,31 @@ class Vox200Parser:
                 has = any(m in model_indices_with_vox for m in models)
                 shape_has_vox[shape_node] = has
 
+            # Helper to resolve node->layer values robustly against LAYR data.
+            def _resolve_layer_name(layer_candidate):
+                # If candidate directly matches a LAYR id, return it
+                if layer_candidate is None:
+                    return None
+                try:
+                    # candidate may already be a layer id
+                    if layer_candidate in self.layer_id_to_name:
+                        return self.layer_id_to_name[layer_candidate]
+                except Exception:
+                    pass
+                # candidate may be an index into ordered_layer_ids (0-based)
+                try:
+                    if isinstance(layer_candidate, int):
+                        if layer_candidate >= 0 and layer_candidate < len(ordered_layer_ids):
+                            real_lid = ordered_layer_ids[layer_candidate]
+                            return self.layer_id_to_name.get(real_lid)
+                        # also try 1-based off-by-one
+                        if layer_candidate - 1 >= 0 and layer_candidate - 1 < len(ordered_layer_ids):
+                            real_lid = ordered_layer_ids[layer_candidate - 1]
+                            return self.layer_id_to_name.get(real_lid)
+                except Exception:
+                    pass
+                return None
+
             # --- Final robust mapping: prefer model->shape->transform->_name, but avoid helper nodes and ensure uniqueness ---
             final_map = {}
             used_names = set()
@@ -250,7 +276,7 @@ class Vox200Parser:
                             for tn in transform_nodes:
                                 layer_id = self.node_to_layer.get(tn)
                                 if layer_id is not None:
-                                    layr_name = self.layer_id_to_name.get(layer_id)
+                                    layr_name = _resolve_layer_name(layer_id)
                                     if layr_name:
                                         chosen = layr_name
                                         reason = f"LAYR name via transform node {tn} -> layer {layer_id}"
@@ -308,7 +334,7 @@ class Vox200Parser:
                             for tn in transform_nodes:
                                 layer_id = self.node_to_layer.get(tn)
                                 if layer_id is not None:
-                                    layr_name = self.layer_id_to_name.get(layer_id)
+                                    layr_name = _resolve_layer_name(layer_id)
                                     if layr_name:
                                         chosen = layr_name
                                         break
