@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 RenameExportsByCentroid.py
-Final renamer (safe, surgical):
-- Transfer descriptive names from tiny helper parts to the most appropriate large winner.
-- Prioritize high-value donors (head/eyes/face) and tiny donors, so important names are assigned first.
-- Winners sorted by size (largest first). Very large winners may waive centroid distance checks.
-- Dry-run by default; --commit performs two-phase safe renames with backups.
+Safe, final renamer:
+- Preserve descriptive names already assigned to non-suspect parts (1:1 protection).
+- Transfer descriptive names from tiny helper parts (donors) to large winners when appropriate.
+- Prioritize high-value donor names (head/face) via an allow-list or safe auto-unlock when a trusted large winner exists.
+- Winners considered by descending size; very large winners can waive centroid checks.
+- Dry-run by default; --commit performs renames and creates backups.
 """
 import os
 import glob
@@ -35,38 +36,18 @@ parser_arg.add_argument("--vox", help="Optional: limit to a single .vox basename
 parser_arg.add_argument("--suspect-threshold", type=int, default=10, help="Max voxel count for a part to be considered a suspect helper (default 10).")
 parser_arg.add_argument("--size-ratio-threshold", type=float, default=4.0, help="Required ratio between winning part and suspect donor (default 4.0).")
 parser_arg.add_argument("--centroid-threshold", type=float, default=10.0, help="Max centroid distance for non-essential transfers (default 10.0).")
-parser_arg.add_argument("--name-trust-threshold", type=int, default=100, help="If winning part is larger than this, it is trusted and can claim any name (default 100).")
+parser_arg.add_argument("--name-trust-threshold", type=int, default=100, help="If winning part is larger than this, it may override distance checks (default 100).")
+parser_arg.add_argument("--allow-transfer", nargs="*", default=[], help="Explicit donor names to allow transfer even if protected (e.g. --allow-transfer Head)")
 parser_arg.add_argument("--debug", action="store_true", help="Emit debug claim info to console and include in report")
-
 args = parser_arg.parse_args()
+
+# High-priority tokens that we may auto-unlock if a trusted large winner exists.
+HIGH_PRIORITY_NAMES = set(["head", "face"])
 
 def backup_path(path):
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     base = os.path.basename(path)
     return os.path.join(os.path.dirname(path), f"{base}.bak.{ts}")
-
-def read_exportlog_counts(export_dir):
-    """Parse ExportLog.txt if present to get declared voxel counts for exported files."""
-    out = {}
-    p = os.path.join(export_dir, "ExportLog.txt")
-    if not os.path.exists(p):
-        return out
-    try:
-        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if line.lower().startswith("exported"):
-                    try:
-                        parts = line.split("as", 1)[1].strip()
-                        filename = parts.split(" (source=", 1)[0].split()[0]
-                        m = re.search(r'\((\d+)\s+voxels\)', line)
-                        count = int(m.group(1)) if m else 0
-                        out[filename] = count
-                    except Exception:
-                        continue
-    except Exception:
-        pass
-    return out
 
 def aabb_iou(min_a, max_a, min_b, max_b):
     inter_min = np.maximum(min_a, min_b)
@@ -92,110 +73,82 @@ def looks_descriptive(name):
         return False
     return True
 
-def try_hungarian(cost_matrix):
-    try:
-        from scipy.optimize import linear_sum_assignment
-        r, c = linear_sum_assignment(cost_matrix)
-        return r.tolist(), c.tolist()
-    except Exception:
-        return None
-
-def greedy_with_pairwise_improvement(cost):
-    n_rows, n_cols = cost.shape
-    rows = list(range(n_rows))
-    cols = list(range(n_cols))
-    assigned_cols = set()
-    assignment = [-1] * n_rows
-    for r in rows:
-        col_order = sorted(cols, key=lambda c: cost[r, c])
-        chosen = None
-        for c in col_order:
-            if c not in assigned_cols:
-                chosen = c
-                break
-        if chosen is not None:
-            assignment[r] = chosen
-            assigned_cols.add(chosen)
-    unused_cols = [c for c in cols if c not in assigned_cols]
-    for i, a in enumerate(assignment):
-        if a == -1:
-            if unused_cols:
-                assignment[i] = unused_cols.pop(0)
-            else:
-                assignment[i] = None
-    def total_cost(assign):
-        s = 0.0
-        for i, c in enumerate(assign):
-            if c is None:
-                s += 1e6
-            else:
-                s += cost[i, c]
-        return s
-    current_cost = total_cost(assignment)
-    improved = True
-    while improved:
-        improved = False
-        n = len(assignment)
-        for i in range(n):
-            for j in range(i+1, n):
-                ai = assignment[i]
-                aj = assignment[j]
-                if ai is None or aj is None:
-                    continue
-                new_assign = assignment[:]
-                new_assign[i], new_assign[j] = aj, ai
-                new_cost = total_cost(new_assign)
-                if new_cost + 1e-12 < current_cost:
-                    assignment = new_assign
-                    current_cost = new_cost
-                    improved = True
-                    break
-            if improved:
-                break
-    row_idx = [i for i in range(len(assignment))]
-    col_idx = [assignment[i] if assignment[i] is not None else -1 for i in range(len(assignment))]
-    return row_idx, col_idx
-
 def transfer_suspect_names(parser, model_centroids, model_counts):
     """
-    Transfer descriptive names from tiny donors to the best large winners.
-    Priority:
-      1) donor ordering: high-value tokens (head/eyes/face) first, then smaller donors first
-      2) winners ordered by size (largest first); first winner that satisfies size ratio
-         and distance (or is trusted) wins.
-    Returns: dict {winner_raw_key: donor_name}
+    Build safe transfers:
+    - protected_names: descriptive names already assigned to non-suspect parts (preserve 1:1).
+    - suspect donors: tiny descriptive parts not protected.
+    - winners: large parts (trusted candidates).
+    - Transfers are applied by donor priority (head/face first) and winner size (largest first).
+    - allow-transfer CLI and HIGH_PRIORITY_NAMES auto-unlock control controlled overrides.
+    Returns transfers dict: {winner_raw_key: donor_name}
     """
-    suspect_names = {}    # donor_name -> donor_raw_key
-    trusted_winners = {}  # winner_raw_key -> current_name
+    allow_list = set([str(x) for x in (args.allow_transfer or [])])
 
-    # collect donors and winners
-    for raw_key, name in parser.raw_part_name_map.items():
-        if not looks_descriptive(name):
+    # 1) Protected names: assigned by layer_name_map to non-empty parts
+    protected_names = set()
+    for rk, nm in parser.layer_name_map.items():
+        if nm and not str(nm).startswith("Part_"):
+            protected_names.add(str(nm))
+
+    # 2) Also protect descriptive names assigned to non-suspect raw parts
+    for rk, nm in parser.raw_part_name_map.items():
+        if nm and looks_descriptive(nm):
+            cnt = model_counts.get(rk, 0)
+            if cnt > args.suspect_threshold:
+                protected_names.add(str(nm))
+
+    # 3) Collect donors and winners
+    suspect_donors = {}   # name -> donor_raw_key
+    trusted_winners = {}  # raw_key -> current_name
+    for rk, nm in parser.raw_part_name_map.items():
+        if not looks_descriptive(nm):
             continue
-        count = model_counts.get(raw_key, 0)
-        if count <= args.suspect_threshold:
-            suspect_names[name] = raw_key
-        elif count > args.suspect_threshold:
-            trusted_winners[raw_key] = name
+        cnt = model_counts.get(rk, 0)
+        name_str = str(nm)
+        if cnt <= args.suspect_threshold:
+            # Decide whether to skip protected donor or allow auto-unlock
+            if name_str in protected_names and name_str not in allow_list:
+                nl = name_str.lower()
+                # auto-unlock only for high-priority tokens when a trusted big candidate exists
+                if nl in HIGH_PRIORITY_NAMES:
+                    donor_cnt = cnt
+                    big_candidate_exists = any(
+                        (mc >= args.name_trust_threshold and mc >= math.ceil(args.size_ratio_threshold * max(1, donor_cnt)))
+                        for mc in model_counts.values()
+                    )
+                    if not big_candidate_exists:
+                        if args.debug:
+                            print(f"[SKIP_PROTECTED_DONOR] {rk} name='{nm}' protected and no big candidate; skipping donor.")
+                        continue
+                    # else allow donor through (Head will be considered)
+                else:
+                    if args.debug:
+                        print(f"[SKIP_PROTECTED_DONOR] {rk} name='{nm}' is protected; not treated as donor.")
+                    continue
+            suspect_donors[name_str] = rk
+        else:
+            trusted_winners[rk] = nm
 
-    if not suspect_names or not trusted_winners:
+    if not suspect_donors or not trusted_winners:
         return {}
 
-    # donor ordering: high-value tokens first, then small counts
+    # 4) Order donors: high-priority tokens first, then smallest donors
     def donor_sort_key(item):
         name, key = item
         nl = name.lower()
-        priority = 0 if any(tok in nl for tok in ("head", "eyes", "face")) else 1
+        priority = 0 if any(tok in nl for tok in HIGH_PRIORITY_NAMES) else 1
         cnt = model_counts.get(key, 0)
         return (priority, cnt)
-    donor_items = sorted(list(suspect_names.items()), key=donor_sort_key)
+    donor_items = sorted(list(suspect_donors.items()), key=donor_sort_key)
 
-    # winners sorted by descending size
+    # 5) Winners sorted by descending size
     sorted_winners = sorted(trusted_winners.keys(), key=lambda k: model_counts.get(k, 0), reverse=True)
 
     transfers = {}
     claimed = set()
 
+    # 6) Iterate donors and pick first acceptable winner (largest-first)
     for donor_name, donor_key in donor_items:
         if donor_name in claimed:
             continue
@@ -207,23 +160,38 @@ def transfer_suspect_names(parser, model_centroids, model_counts):
         for winner_key in sorted_winners:
             if winner_key in transfers:
                 continue
+
             winner_count = model_counts.get(winner_key, 0)
-            # size ratio requirement
+
+            # Guarded overwrite: normally do not overwrite a winner that already has a descriptive parser-assigned layer name,
+            # but allow if donor is explicitly allowed or a high-priority token AND the winner is trusted (large).
+            winner_parser_name = parser.layer_name_map.get(winner_key)
+            if winner_parser_name and not str(winner_parser_name).startswith("Part_"):
+                nl_donor = donor_name.lower()
+                donor_allowed = (donor_name in allow_list) or (nl_donor in HIGH_PRIORITY_NAMES)
+                if not donor_allowed or winner_count < args.name_trust_threshold:
+                    if args.debug:
+                        print(f"[SKIP_WINNER_ALREADY_NAMED] winner {winner_key} already has parser name '{winner_parser_name}'; donor_allowed={donor_allowed} winner_count={winner_count}")
+                    continue
+
             if winner_count < math.ceil(args.size_ratio_threshold * max(1, donor_count)):
                 continue
+
             winner_centroid = model_centroids.get(winner_key)
             if winner_centroid is None:
                 continue
+
             dist = float(np.linalg.norm(winner_centroid - donor_centroid))
-            # distance check unless winner is trusted (very large)
             max_dist_check = args.centroid_threshold
             if winner_count >= args.name_trust_threshold:
+                # very large winners waive distance
                 max_dist_check = float("inf")
+
             if dist > max_dist_check:
                 if args.debug:
                     print(f"[DEBUG] donor {donor_key} '{donor_name}' skip {winner_key} dist {dist:.2f} > {max_dist_check:.2f}")
                 continue
-            # winner passes checks — because winners are sorted by size, accept immediately
+
             transfers[winner_key] = donor_name
             claimed.add(donor_name)
             if args.debug:
@@ -232,7 +200,7 @@ def transfer_suspect_names(parser, model_centroids, model_counts):
 
     return transfers
 
-# Main
+# Main driver
 vox_files = [f for f in os.listdir(BASE_DIR) if f.lower().endswith(".vox")]
 if args.vox:
     target = f"{args.vox}.vox"
@@ -255,10 +223,10 @@ for vox_file in vox_files:
         parser = Vox200Parser(vox_path).parse()
         voxels_by_layer = parser.voxels_by_layer
         layer_name_map = parser.layer_name_map
-        raw_name_map = parser.raw_part_name_map
+        raw_part_name_map = parser.raw_part_name_map
         model_keys = [k for k in voxels_by_layer.keys() if len(voxels_by_layer[k]) > 0]
 
-        # per-part stats
+        # per-model stats
         model_centroids = {}
         model_counts = {}
         model_aabbs = {}
@@ -271,11 +239,9 @@ for vox_file in vox_files:
 
         # compute transfers
         transfers = transfer_suspect_names(parser, model_centroids, model_counts)
-        transfers_debug = []
-        for k, v in transfers.items():
-            transfers_debug.append(f"[TRANSFER_ASSIGNED] {k} => '{v}'")
+        transfers_debug = [f"[TRANSFER_ASSIGNED] {k} => '{v}'" for k, v in transfers.items()]
 
-        # locate exported OBJ files
+        # exported OBJ files
         exported_dir = os.path.join(EXPORT_ROOT, vox_base)
         exported_paths = sorted(glob.glob(os.path.join(exported_dir, "*.obj")))
         report_path = os.path.join(REPORTS_DIR, f"RenamingReport_{vox_base}.txt")
@@ -290,7 +256,6 @@ for vox_file in vox_files:
                 rep.write(f"RenamingReport (skipped) for: {vox_file}\n\n")
                 rep.write(f"SKIPPED: No exported .obj files found in {exported_dir}.\n")
             print(f"  Report written: {report_path} (SKIPPED)")
-            print(f"  Manifest written: {manifest_path} (SKIPPED)")
             continue
 
         exported_centroids = {}
@@ -306,21 +271,25 @@ for vox_file in vox_files:
                 exported_centroids[p] = np.array([math.inf, math.inf, math.inf], dtype=float)
                 file_aabbs[p] = (np.array([math.inf, math.inf, math.inf], dtype=float), np.array([-math.inf, -math.inf, -math.inf], dtype=float))
 
-        exportlog_counts = read_exportlog_counts(exported_dir)
+        # optional: extract counts from ExportLog if present
+        exportlog_counts = {}
+        exp_log = os.path.join(exported_dir, "ExportLog.txt")
+        if os.path.exists(exp_log):
+            try:
+                with open(exp_log, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        m = re.search(r'Part_(\d+).*?(\d+)\s+voxels', line)
+                        if m:
+                            fname = f"Part_{m.group(1)}.obj"
+                            exportlog_counts[fname] = int(m.group(2))
+            except Exception:
+                pass
+
         for p in exported_paths:
             fname = os.path.basename(p)
-            ccount = exportlog_counts.get(fname)
-            if ccount is None:
-                try:
-                    m = trimesh.load(p, force='mesh')
-                    est_vox = max(1, int(round(m.faces.shape[0] / 12.0))) if hasattr(m, "faces") else 0
-                except Exception:
-                    est_vox = 0
-                exported_mesh_counts[p] = est_vox
-            else:
-                exported_mesh_counts[p] = ccount if ccount is not None else 0
+            exported_mesh_counts[p] = exportlog_counts.get(fname, 0)
 
-        # cost matrix (models x files)
+        # cost matrix
         models = model_keys
         files = exported_paths
         R = len(models)
@@ -355,15 +324,27 @@ for vox_file in vox_files:
                 cost_val = dist_norm + beta * count_norm + gamma * iou_penalty
                 cost[i, j] = cost_val
 
-        hung = try_hungarian(cost)
-        if hung is not None:
-            r_idx, c_idx = hung
+        # assignment (Hungarian or greedy fallback)
+        try:
+            from scipy.optimize import linear_sum_assignment
+            r_idx, c_idx = linear_sum_assignment(cost)
             assignment_cols = [-1] * N
             for r, c in zip(r_idx, c_idx):
                 assignment_cols[r] = c
-        else:
-            r_idx, c_idx = greedy_with_pairwise_improvement(cost)
-            assignment_cols = c_idx
+        except Exception:
+            def greedy(cost):
+                n_rows, n_cols = cost.shape
+                assigned_cols = set()
+                assignment = [-1] * n_rows
+                for r in range(n_rows):
+                    order = sorted(range(n_cols), key=lambda c: cost[r, c])
+                    for c in order:
+                        if c not in assigned_cols:
+                            assignment[r] = c
+                            assigned_cols.add(c)
+                            break
+                return assignment
+            assignment_cols = greedy(cost)
 
         assignment = {}
         for i, mk in enumerate(models):
@@ -378,6 +359,7 @@ for vox_file in vox_files:
         manifest = {"vox": vox_file, "timestamp": datetime.datetime.now().isoformat(), "renames": []}
 
         for raw_key, (exp_path, dist) in assignment.items():
+            # transfers override parser names
             intended_name = transfers.get(raw_key)
             if not intended_name:
                 pname = layer_name_map.get(raw_key)

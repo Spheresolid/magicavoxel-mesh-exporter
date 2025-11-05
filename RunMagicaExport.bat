@@ -64,14 +64,24 @@ if exist "%SCRIPT_DIR%CheckEmptyLayers.py" (
     echo CheckEmptyLayers.py not detected; skipping it.
 )
 
-:: Main exporter (exports .vox -> exported_meshes/<voxbasename>/)
+:: --- Export step (apply per-model .vox transforms and remap to Maya Y-up) ---
 echo Running ExportMeshes.py...
 if exist "%SCRIPT_DIR%ExportMeshes.py" (
-    call "%PYTHON_CMD%" -u "%SCRIPT_DIR%ExportMeshes.py"
+    call "%PYTHON_CMD%" -u "%SCRIPT_DIR%ExportMeshes.py" --to-maya
     if errorlevel 1 (
         echo ExportMeshes.py failed.
         set "RC=1"
         goto :finish
+    )
+    :: Post-export fixup to improve OBJ compatibility with Maya
+    if exist "%SCRIPT_DIR%ExportMeshesFixup.py" (
+        echo Running ExportMeshesFixup.py to validate/fix exported OBJs...
+        call "%PYTHON_CMD%" -u "%SCRIPT_DIR%ExportMeshesFixup.py" --to-maya
+        if errorlevel 1 (
+            echo ExportMeshesFixup.py reported issues. Check reports\OBJValidationReport.txt
+        )
+    ) else (
+        echo ExportMeshesFixup.py not found; skipping OBJ fixup.
     )
 ) else (
     echo ExportMeshes.py not found; aborting.
@@ -100,11 +110,8 @@ if exist "%SCRIPT_DIR%CompareExports.py" (
 
 :: Print part assignments — run live so output appears in console immediately
 if exist "%SCRIPT_DIR%PrintPartAssignments.py" (
-    echo Running PrintPartAssignments.py ^(live output^)...
-    
-    :: Call the script once; it writes its own report.
+    echo Running PrintPartAssignments.py ^(live output^)...    
     call "%PYTHON_CMD%" -u "%SCRIPT_DIR%PrintPartAssignments.py"
-    
     if errorlevel 1 (
         echo [ERROR] PrintPartAssignments.py reported an error.
     ) else (
@@ -147,6 +154,7 @@ exit /b %RC%
         endlocal
         exit /b 1
     )
+
     :: write a stable log copy (single run) so user can inspect later
     call "%PYTHON_CMD%" -u "%SCRIPT_DIR%RenameExportsByCentroid.py" --vox Character --debug > "%SCRIPT_DIR%reports\RenameDryrun_Character.log" 2>&1
 

@@ -19,6 +19,8 @@ class Vox200Parser:
         self.node_to_layer = {}            # nTRN: transform_node_id -> layer_id (if present)
         self.shape_node_to_models = {}     # nTRN/nSHP: shape_node_id -> [model_ids]
         self.model_id_to_shape = {}        # model_id -> shape_node_id
+        self.node_transforms = {}          # node_id -> attr dict (captures _t/_r etc)
+        self.model_transforms = {}         # model_idx -> attrs (selected transform attrs)
 
     def _parse_attr_dict_from(self, content, offset, count):
         """Read count attribute key/value pairs from content at offset. Returns (attrs_dict, new_offset)."""
@@ -111,7 +113,10 @@ class Vox200Parser:
                     attr_dict_len = struct.unpack("<I", content[4:8])[0]
                     offset = 8
                     attrs, offset = self._parse_attr_dict_from(content, offset, attr_dict_len)
-                    name = attrs.get("_name")
+                    # store full attrs so downstream can pick up _t/_r etc.
+                    if attrs:
+                        self.node_transforms[node_id] = attrs
+                    name = attrs.get("_name") if attrs else None
                     # try to read child node id if present (best-effort)
                     child_node_id = None
                     if offset + 4 <= len(content):
@@ -121,7 +126,6 @@ class Vox200Parser:
                         except Exception:
                             child_node_id = None
                     # Try to read layer id if present at common offset (best-effort)
-                    # Some exporters put layer_id further in the content (heuristic)
                     try:
                         if len(content) >= 28:
                             # store the raw integer seen in the chunk; interpretation will be resolved later
@@ -359,7 +363,23 @@ class Vox200Parser:
                 raw_map[raw_key] = chosen
 
             self.raw_part_name_map = raw_map
-            # --- END NEW population ---
+
+            # --- NEW: derive model_transforms mapping (model_idx -> attrs) from node_transforms -->
+            model_trans = {}
+            for model_idx in sorted(all_model_indices):
+                shape_node = self.model_id_to_shape.get(model_idx)
+                if shape_node is None:
+                    continue
+                transform_nodes = [tn for tn, child in self.node_to_child.items() if child == shape_node]
+                picked = None
+                for tn in transform_nodes:
+                    attrs = self.node_transforms.get(tn)
+                    if attrs:
+                        picked = attrs
+                        break
+                if picked:
+                    model_trans[model_idx] = picked
+            self.model_transforms = model_trans
 
             # Write detailed DebugNameMap_<voxname>.txt in reports/
             try:
@@ -420,6 +440,10 @@ class Vox200Parser:
                     for raw_key, chosen in sorted(self.raw_part_name_map.items()):
                         count = len(self.voxels_by_layer.get(raw_key, []))
                         f.write(f"  {raw_key} ({count} voxels) => {chosen}\n")
+
+                    f.write("\nModel transforms (model_idx -> attrs):\n")
+                    for midx, attrs in sorted(self.model_transforms.items()):
+                        f.write(f"  Model {midx} => {attrs}\n")
 
                     f.write("\nEnd of DebugNameMap\n")
             except Exception:
