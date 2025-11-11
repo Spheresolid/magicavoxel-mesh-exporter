@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 RenameExportsByCentroid.py
-Safe, final renamer:
-- Preserve descriptive names already assigned to non-suspect parts (1:1 protection).
-- Transfer descriptive names from tiny helper parts (donors) to large winners when appropriate.
-- Prioritize high-value donor names (head/face) via an allow-list or safe auto-unlock when a trusted large winner exists.
-- Winners considered by descending size; very large winners can waive centroid checks.
-- Dry-run by default; --commit performs renames and creates backups.
+Safe, no-scaling renamer:
+- Reads parser intent and exported OBJ centroids/AABBs only (no geometry modification).
+- Preserves descriptive names already assigned to non-suspect parts (1:1 protection).
+- Transfers descriptive names from tiny helper parts (donors) to large winners when appropriate.
+- Dry-run by default; --commit performs atomic file renames and creates backups.
 """
 import os
 import glob
@@ -21,6 +20,22 @@ import trimesh
 import traceback
 import re
 from Vox200Parser import Vox200Parser
+
+# Safety guard — prevent accidental geometry mutation from this script.
+_mutating_methods = [
+    "apply_scale", "apply_translation", "apply_transform",
+    "export", "export_obj", "export_wkb", "export_wkt",
+    "remove_degenerate_faces", "remove_duplicate_faces",
+    "update_faces", "update_vertices",
+]
+def _raise_mutation(*args, **kwargs):
+    raise RuntimeError("RenameExportsByCentroid.py is prohibited from modifying mesh geometry or exporting meshes.")
+for _m in _mutating_methods:
+    if hasattr(trimesh.Trimesh, _m):
+        try:
+            setattr(trimesh.Trimesh, _m, _raise_mutation)
+        except Exception:
+            pass
 
 def sanitize_filename(name):
     return ''.join(c if c.isalnum() or c in (' ', '.', '_') else '_' for c in (name or "")).strip()
@@ -39,9 +54,21 @@ parser_arg.add_argument("--centroid-threshold", type=float, default=10.0, help="
 parser_arg.add_argument("--name-trust-threshold", type=int, default=100, help="If winning part is larger than this, it may override distance checks (default 100).")
 parser_arg.add_argument("--allow-transfer", nargs="*", default=[], help="Explicit donor names to allow transfer even if protected (e.g. --allow-transfer Head)")
 parser_arg.add_argument("--debug", action="store_true", help="Emit debug claim info to console and include in report")
+parser_arg.add_argument("--active", choices=["0","1","true","false"], help="Enable/disable the renamer (overrides env RENAME_ACTIVE)")
 args = parser_arg.parse_args()
 
-# High-priority tokens that we may auto-unlock if a trusted large winner exists.
+# Determine active state: CLI --active > ENV RENAME_ACTIVE > default True
+env_active = os.environ.get("RENAME_ACTIVE")
+cli_active = args.active
+active_value = cli_active if cli_active is not None else (env_active if env_active is not None else "1")
+RENAMER_ACTIVE = not str(active_value).lower() in ("0", "false", "no", "n")
+if not RENAMER_ACTIVE:
+    dryrun_log = os.path.join(REPORTS_DIR, "RenameDryrun_Character.log")
+    with open(dryrun_log, "w", encoding="utf-8") as f:
+        f.write("RenameExportsByCentroid.py: renamer disabled by environment/CLI (RENAME_ACTIVE=0).\nDry-run skipped.\n")
+    print("[SKIP] RenameExportsByCentroid.py disabled by RENAME_ACTIVE=0; wrote RenameDryrun_Character.log")
+    raise SystemExit(0)
+
 HIGH_PRIORITY_NAMES = set(["head", "face"])
 
 def backup_path(path):
@@ -67,50 +94,36 @@ def looks_descriptive(name):
     s = str(name).strip()
     if len(s) <= 2:
         return False
-    if re.fullmatch(r'^\d+$', s):  # numeric-only
+    if re.fullmatch(r'^\d+$', s):
         return False
     if len(s) <= 3 and any(c.isdigit() for c in s):
         return False
     return True
 
 def transfer_suspect_names(parser, model_centroids, model_counts):
-    """
-    Build safe transfers:
-    - protected_names: descriptive names already assigned to non-suspect parts (preserve 1:1).
-    - suspect donors: tiny descriptive parts not protected.
-    - winners: large parts (trusted candidates).
-    - Transfers are applied by donor priority (head/face first) and winner size (largest first).
-    - allow-transfer CLI and HIGH_PRIORITY_NAMES auto-unlock control controlled overrides.
-    Returns transfers dict: {winner_raw_key: donor_name}
-    """
     allow_list = set([str(x) for x in (args.allow_transfer or [])])
 
-    # 1) Protected names: assigned by layer_name_map to non-empty parts
     protected_names = set()
     for rk, nm in parser.layer_name_map.items():
         if nm and not str(nm).startswith("Part_"):
             protected_names.add(str(nm))
 
-    # 2) Also protect descriptive names assigned to non-suspect raw parts
     for rk, nm in parser.raw_part_name_map.items():
         if nm and looks_descriptive(nm):
             cnt = model_counts.get(rk, 0)
             if cnt > args.suspect_threshold:
                 protected_names.add(str(nm))
 
-    # 3) Collect donors and winners
-    suspect_donors = {}   # name -> donor_raw_key
-    trusted_winners = {}  # raw_key -> current_name
+    suspect_donors = {}
+    trusted_winners = {}
     for rk, nm in parser.raw_part_name_map.items():
         if not looks_descriptive(nm):
             continue
         cnt = model_counts.get(rk, 0)
         name_str = str(nm)
         if cnt <= args.suspect_threshold:
-            # Decide whether to skip protected donor or allow auto-unlock
             if name_str in protected_names and name_str not in allow_list:
                 nl = name_str.lower()
-                # auto-unlock only for high-priority tokens when a trusted big candidate exists
                 if nl in HIGH_PRIORITY_NAMES:
                     donor_cnt = cnt
                     big_candidate_exists = any(
@@ -121,7 +134,6 @@ def transfer_suspect_names(parser, model_centroids, model_counts):
                         if args.debug:
                             print(f"[SKIP_PROTECTED_DONOR] {rk} name='{nm}' protected and no big candidate; skipping donor.")
                         continue
-                    # else allow donor through (Head will be considered)
                 else:
                     if args.debug:
                         print(f"[SKIP_PROTECTED_DONOR] {rk} name='{nm}' is protected; not treated as donor.")
@@ -133,7 +145,6 @@ def transfer_suspect_names(parser, model_centroids, model_counts):
     if not suspect_donors or not trusted_winners:
         return {}
 
-    # 4) Order donors: high-priority tokens first, then smallest donors
     def donor_sort_key(item):
         name, key = item
         nl = name.lower()
@@ -141,14 +152,11 @@ def transfer_suspect_names(parser, model_centroids, model_counts):
         cnt = model_counts.get(key, 0)
         return (priority, cnt)
     donor_items = sorted(list(suspect_donors.items()), key=donor_sort_key)
-
-    # 5) Winners sorted by descending size
     sorted_winners = sorted(trusted_winners.keys(), key=lambda k: model_counts.get(k, 0), reverse=True)
 
     transfers = {}
     claimed = set()
 
-    # 6) Iterate donors and pick first acceptable winner (largest-first)
     for donor_name, donor_key in donor_items:
         if donor_name in claimed:
             continue
@@ -162,9 +170,6 @@ def transfer_suspect_names(parser, model_centroids, model_counts):
                 continue
 
             winner_count = model_counts.get(winner_key, 0)
-
-            # Guarded overwrite: normally do not overwrite a winner that already has a descriptive parser-assigned layer name,
-            # but allow if donor is explicitly allowed or a high-priority token AND the winner is trusted (large).
             winner_parser_name = parser.layer_name_map.get(winner_key)
             if winner_parser_name and not str(winner_parser_name).startswith("Part_"):
                 nl_donor = donor_name.lower()
@@ -182,10 +187,7 @@ def transfer_suspect_names(parser, model_centroids, model_counts):
                 continue
 
             dist = float(np.linalg.norm(winner_centroid - donor_centroid))
-            max_dist_check = args.centroid_threshold
-            if winner_count >= args.name_trust_threshold:
-                # very large winners waive distance
-                max_dist_check = float("inf")
+            max_dist_check = args.centroid_threshold if winner_count < args.name_trust_threshold else float("inf")
 
             if dist > max_dist_check:
                 if args.debug:

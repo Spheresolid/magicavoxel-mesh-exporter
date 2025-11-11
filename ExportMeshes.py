@@ -1,53 +1,57 @@
-# ExportMeshes.py
 # -*- coding: utf-8 -*-
 """
 ExportMeshes.py
 Exports per-Part meshes from .vox using Vox200Parser, applies per-model transforms (if present),
-and optionally remaps axes (preset --to-maya uses "x,z,-y").
+and remaps axes for DCC. Final mesh scaling (--mesh-scale) is applied only after
+voxel->mesh conversion and VOX transforms to preserve silhouette integrity.
 
-Key safety features:
- - Validate rotation/translation attrs before applying.
- - Clamp/ignore invalid transforms (NaN/Inf or enormous translations).
- - Normalize numeric precision and remove degenerate geometry before export.
- - Deterministic OBJ writer (write_stable_obj) used; falls back to trimesh exporter on unexpected geometry.
- - Final Maya compatibility export step to ensure vertex normals and deterministic OBJ layout.
- - Optionally write hard-edged OBJs (per-face duplicated vertices + per-face normals) so Maya gets flat shading.
+Features:
+ - CLI: --mesh-scale, --scale-factor (legacy), --ignore-model-scale, --no-extent-correction, --to-maya, --axes-map, --vox, --debug
+ - Robust logging: exported_meshes/<vox>/ExportLog.txt and reports/ExportMeshesFatal_*.log on fatal errors.
+ - Defensive: per-part exceptions are logged and processing continues.
 """
+from __future__ import annotations
+
 import os
 import sys
 import math
 import traceback
-import csv
-import glob
-import re
 import argparse
-
+import datetime
 import numpy as np
 import trimesh
-from trimesh.transformations import quaternion_matrix, euler_matrix
+from trimesh.transformations import quaternion_matrix, euler_matrix, translation_matrix
 
 from Vox200Parser import Vox200Parser
 
 # CLI
 cli = argparse.ArgumentParser(description="Export .vox parts as .obj with optional per-model transforms and axes remap.")
 cli.add_argument("--to-maya", action="store_true", help="Remap exported geometry into Maya's world (preset axes map).")
-cli.add_argument("--axes-map", help="Custom axes map, e.g. 'x,z,-y' meaning new=(x, z, -y).")
+cli.add_argument("--axes-map", help="Custom axes map, e.g. 'x,z,-y'.")
 cli.add_argument("--vox", help="Optional: limit to a single .vox basename (no extension).")
-cli.add_argument("--debug", action="store_true", help="Emit debug info")
-cli.add_argument("--hard-edges", action="store_true", help="Write hard-edged OBJ (duplicate vertices per face) for flat shading (Maya-safe).")
+cli.add_argument("--debug", action="store_true", help="Enable debug logging.")
+cli.add_argument("--voxel-size", type=float, default=1.0, help="Size of one voxel in output units (default 1.0).")
+cli.add_argument("--scale-factor", type=float, default=1.0, help="(Legacy) global scale multiplier - kept for backwards compat.")
+cli.add_argument("--mesh-scale", type=float, default=1.0, help="Final uniform scale applied to mesh after conversion (default 1.0).")
+cli.add_argument("--no-extent-correction", action="store_true", help="Skip extent-based ensure_voxel_scale step.")
+cli.add_argument("--ignore-model-scale", action="store_true", help="Ignore per-model VOX 's' scale so voxels are not scaled prior to mesh export.")
 args = cli.parse_args()
 
-# Pick hard edges automatically when exporting for Maya, or when user explicitly requested it.
-HARD_EDGES = bool(args.hard_edges) or bool(args.to_maya)
+# Axis remap preset
+AXES_MAP_SPEC = "x,z,-y" if args.to_maya else (args.axes_map or None)
 
-# Preset
-AXES_MAP_SPEC = None
-if args.to_maya:
-    AXES_MAP_SPEC = "x,z,-y"
-elif args.axes_map:
-    AXES_MAP_SPEC = args.axes_map
+# Decide final mesh scale:
+EPS = 1e-12
+if abs(args.mesh_scale - 1.0) > EPS:
+    MESH_SCALE = float(args.mesh_scale)
+elif abs(args.scale_factor - 1.0) > EPS:
+    MESH_SCALE = float(args.scale_factor)
+else:
+    MESH_SCALE = 1.0
 
-def sanitize_filename(name):
+# ----------------- Helpers -----------------
+
+def sanitize_filename(name: str) -> str:
     if not name:
         return ""
     s = str(name)
@@ -63,441 +67,274 @@ def compute_centroid(voxels):
         return np.array([math.nan, math.nan, math.nan], dtype=float)
     return pts.mean(axis=0)
 
-def parse_axes_map(spec):
-    if not spec:
+def get_axes_matrix(axes_spec: str) -> np.ndarray:
+    if not axes_spec:
+        return np.identity(4)
+    axes = axes_spec.split(',')
+    if len(axes) != 3:
+        return np.identity(4)
+    T = np.zeros((4,4), dtype=float)
+    T[3,3] = 1.0
+    orig_map = {'x':0,'y':1,'z':2}
+    for i, axis in enumerate(axes):
+        is_neg = axis.startswith('-')
+        orig_axis_name = axis.lstrip('-').strip()
+        if orig_axis_name in orig_map:
+            orig_index = orig_map[orig_axis_name]
+            T[i, orig_index] = -1.0 if is_neg else 1.0
+        else:
+            if args.debug:
+                print(f"[DEBUG] get_axes_matrix: unknown axis token '{axis}'")
+    return T
+
+def remap_axes(mesh: trimesh.Trimesh, axes_spec: str) -> trimesh.Trimesh:
+    if not axes_spec:
+        return mesh
+    T = get_axes_matrix(axes_spec)
+    mesh.apply_transform(T)
+    return mesh
+
+def _reorder_quaternion_for_trimesh(q):
+    if q is None:
         return None
-    toks = [t.strip().lower() for t in spec.split(",")]
-    if len(toks) != 3:
-        raise ValueError("axes-map must have three comma-separated tokens, e.g. x,y,z or x,z,-y")
-    mat = np.zeros((3,3), dtype=float)
-    axis_idx = {"x":0, "y":1, "z":2}
-    for i, tok in enumerate(toks):
-        sign = -1.0 if tok.startswith("-") else 1.0
-        t = tok[1:] if tok.startswith("-") else tok
-        if t not in axis_idx:
-            raise ValueError("invalid axis token in axes-map: " + tok)
-        mat[i, axis_idx[t]] = sign
-    return mat
-
-def write_stable_obj(path, mesh):
-    """
-    Deterministic OBJ writer:
-    - vertices 'v x y z' (6 decimals)
-    - normals 'vn x y z' (6 decimals) when available
-    - faces as triangles using v//vn if normals present, otherwise v v v
-    If faces are non-triangles, fall back to trimesh export.
-    """
-    verts = np.asarray(mesh.vertices, dtype=np.float64)
-    faces = np.asarray(mesh.faces, dtype=int)
-    if faces.ndim != 2 or faces.shape[1] != 3:
-        # fallback: use trimesh writer (explicit file_type)
-        mesh.export(path, file_type='obj')
-        return
-
-    vns = None
     try:
-        if hasattr(mesh, "vertex_normals") and mesh.vertex_normals is not None:
-            vns = np.asarray(mesh.vertex_normals, dtype=np.float64)
-            if vns.shape[0] != verts.shape[0]:
-                vns = None
+        qf = tuple(float(x) for x in q)
     except Exception:
-        vns = None
+        return None
+    if len(qf) != 4:
+        return None
+    abs_vals = [abs(x) for x in qf]
+    if abs_vals[3] >= max(abs_vals[0], abs_vals[1], abs_vals[2]):
+        return (qf[0], qf[1], qf[2], qf[3])
+    return (qf[1], qf[2], qf[3], qf[0])
 
-    fmt = "{:.6f} {:.6f} {:.6f}\n"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Stable OBJ exported by ExportMeshes.py\n")
-        for v in verts:
-            f.write("v " + fmt.format(float(v[0]), float(v[1]), float(v[2])))
-        if vns is not None:
-            for n in vns:
-                f.write("vn " + fmt.format(float(n[0]), float(n[1]), float(n[2])))
-        for face in faces:
-            a, b, c = int(face[0]) + 1, int(face[1]) + 1, int(face[2]) + 1
-            if vns is not None:
-                f.write(f"f {a}//{a} {b}//{b} {c}//{c}\n")
-            else:
-                f.write(f"f {a} {b} {c}\n")
-
-def write_hard_obj(path, mesh):
-    """
-    Write an OBJ with hard edges:
-    - duplicate vertex coordinates per face so vertices are not shared
-    - write a face-normal (vn) per vertex (all three the same) so faces are flat
-    - write 's off' to disable smoothing groups
-    This produces flat-shaded OBJ and explicit vn per-face.
-    """
-    verts = np.asarray(mesh.vertices, dtype=np.float64)
-    faces = np.asarray(mesh.faces, dtype=int)
-    fmt = "{:.6f} {:.6f} {:.6f}\n"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Hard-edged OBJ exported by ExportMeshes.py\n")
-        f.write("s off\n")
-        idx = 1
-        for face in faces:
-            # Defensive: ensure indices are ints and in-range
-            a_idx = int(face[0])
-            b_idx = int(face[1])
-            c_idx = int(face[2])
-            if a_idx < 0 or b_idx < 0 or c_idx < 0:
-                # negative indices are unexpected here — fall back to stable writer elsewhere
-                raise RuntimeError("write_hard_obj encountered negative index")
-            v0 = verts[a_idx]
-            v1 = verts[b_idx]
-            v2 = verts[c_idx]
-            e1 = v1 - v0
-            e2 = v2 - v0
-            n = np.cross(e1, e2)
-            norm = np.linalg.norm(n)
-            if not np.isfinite(norm) or norm == 0.0:
-                n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            else:
-                n = n / norm
-            # write three vertex entries (duplicate per-face)
-            f.write("v " + fmt.format(float(v0[0]), float(v0[1]), float(v0[2])))
-            f.write("v " + fmt.format(float(v1[0]), float(v1[1]), float(v1[2])))
-            f.write("v " + fmt.format(float(v2[0]), float(v2[1]), float(v2[2])))
-            # write corresponding normals (one per vertex, same normal)
-            f.write("vn " + fmt.format(float(n[0]), float(n[1]), float(n[2])))
-            f.write("vn " + fmt.format(float(n[0]), float(n[1]), float(n[2])))
-            f.write("vn " + fmt.format(float(n[0]), float(n[1]), float(n[2])))
-            # face referencing v//vn indices
-            f.write(f"f {idx}//{idx} {idx+1}//{idx+1} {idx+2}//{idx+2}\n")
-            idx += 3
-
-def apply_maya_compatibility_export(mesh, export_path, debug=False, hard_edges=False):
-    """
-    Ultimate cleanup for Maya compatibility:
-     - deep process (trimesh.process) to clean geometry
-     - repair (remove degenerate/duplicate faces, unreferenced verts)
-     - triangulate if required
-     - compute/fix vertex normals
-     - write deterministic OBJ via write_stable_obj or write_hard_obj (atomic replace)
-    Returns True on success.
-    """
+def _safe_translation_vec(t):
+    if t is None:
+        return None
     try:
-        m = mesh.copy()
+        tv = np.asarray(t, dtype=float)
+    except Exception:
+        return None
+    if not np.isfinite(tv).all():
+        return None
+    max_abs = 1e5
+    if np.any(np.abs(tv) > max_abs):
+        tv = np.clip(tv, -max_abs, max_abs)
+        if args.debug:
+            print(f"[DEBUG] clamped translation to {tv}")
+    return tv
 
-        # 1) Deep internal cleanup if available
-        try:
-            if hasattr(m, "process"):
-                m.process()
-        except Exception:
+def ensure_voxel_scale(mesh, positions, voxel_size=1.0, export_log_path=None, debug=False):
+    try:
+        if positions is None or positions.size == 0:
             if debug:
-                print("[MAYA_FIX] deep process() failed or not available; continuing")
-
-        # 2) Best-effort repairs
-        for fn in ("remove_degenerate_faces", "remove_duplicate_faces", "remove_unreferenced_vertices"):
+                print("[SCALE] no positions provided; skipping")
+            return False
+        positions = np.asarray(positions, dtype=float)
+        pmin = positions.min(axis=0)
+        pmax = positions.max(axis=0)
+        expected_ext = ((pmax - pmin) + 1.0) * float(voxel_size)
+        bounds = np.asarray(mesh.bounds, dtype=float)
+        mesh_ext = bounds[1] - bounds[0]
+        eps = 1e-8
+        valid = mesh_ext > eps
+        if not np.any(valid):
+            if debug:
+                print(f"[SCALE] invalid mesh extents: {mesh_ext}")
+            return False
+        scale_factors = np.empty(3, dtype=float)
+        scale_factors.fill(np.nan)
+        for i in range(3):
+            if mesh_ext[i] > eps:
+                scale_factors[i] = expected_ext[i] / mesh_ext[i]
+        valid_sf = ~np.isnan(scale_factors)
+        if not np.any(valid_sf):
+            if debug:
+                print("[SCALE] no valid scale factors computed; skipping")
+            return False
+        uni_scale = float(np.median(scale_factors[valid_sf]))
+        if abs(uni_scale - 1.0) > 1e-6:
             try:
-                if hasattr(m, fn):
-                    getattr(m, fn)()
+                mesh_centroid = np.asarray(mesh.centroid, dtype=float)
             except Exception:
-                pass
-
-        # 3) Triangulate if faces are polygons
-        try:
-            fa = np.asarray(getattr(m, "faces", np.array([])), dtype=int)
-            if fa.size == 0:
-                if debug:
-                    print("[MAYA_FIX] Mesh has no faces; skipping export")
-                return False
-            if fa.ndim != 2 or fa.shape[1] != 3:
+                mesh_centroid = (bounds[0] + bounds[1]) / 2.0
+            T1 = np.eye(4); T1[:3,3] = -mesh_centroid
+            S = np.eye(4); S[:3,:3] *= uni_scale
+            T2 = np.eye(4); T2[:3,3] = mesh_centroid
+            M = T2.dot(S).dot(T1)
+            mesh.apply_transform(M)
+            msg = f"[SCALE] applied uniform scale {uni_scale:.6f} to match voxel extents (expected {expected_ext.tolist()}, pre-extents {mesh_ext.tolist()})"
+            if debug:
+                print(msg)
+            if export_log_path:
                 try:
-                    mtri = m.copy().triangulate()
-                    if isinstance(mtri, trimesh.Trimesh) and getattr(mtri, "faces", None) is not None:
-                        m = mtri
-                except Exception:
-                    if debug:
-                        print("[MAYA_FIX] triangulate() failed; will fallback to trimesh exporter")
-        except Exception:
-            if debug:
-                print("[MAYA_FIX] face inspection failed; will fallback to trimesh exporter")
-
-        # 4) Compute/fix normals
-        try:
-            if hasattr(m, "fix_normals"):
-                m.fix_normals()
-            try:
-                _ = m.vertex_normals
-            except Exception:
-                if debug:
-                    print("[MAYA_FIX] vertex_normals access failed")
-        except Exception:
-            if debug:
-                print("[MAYA_FIX] fix_normals failed; continuing")
-
-        # 5) Reduce precision to stable values
-        try:
-            verts = np.asarray(m.vertices, dtype=np.float64)
-            verts = np.round(verts, 6)
-            m.vertices = verts.astype(np.float64)
-        except Exception:
-            pass
-
-        # 6) Write deterministic OBJ to a .tmp.obj and atomically replace
-        tmp = export_path + ".tmp.obj"
-        try:
-            if hard_edges:
-                write_hard_obj(tmp, m)
-            else:
-                write_stable_obj(tmp, m)
-            # final defensive pass: strip mtllib/usemtl if any
-            with open(tmp, "r", encoding="utf-8", errors="ignore") as f_in:
-                lines = [L for L in f_in.readlines() if not (L.strip().lower().startswith("mtllib") or L.strip().lower().startswith("usemtl"))]
-            with open(tmp, "w", encoding="utf-8", errors="ignore") as f_out:
-                f_out.writelines(lines)
-            os.replace(tmp, export_path)
-            return True
-        except Exception as ex:
-            if debug:
-                print(f"[MAYA_FIX] primary writer failed: {ex}; trying trimesh.export fallback")
-            # If hard edges were requested, try hard writer as fallback if primary wasn't hard
-            try:
-                fallback_tmp = export_path + ".tmp.obj"
-                if hard_edges:
-                    # try hard writer explicitly (may raise)
-                    write_hard_obj(fallback_tmp, m)
-                    with open(fallback_tmp, "r", encoding="utf-8", errors="ignore") as f_in:
-                        lines = [L for L in f_in.readlines() if not (L.strip().lower().startswith("mtllib") or L.strip().lower().startswith("usemtl"))]
-                    with open(export_path, "w", encoding="utf-8", errors="ignore") as f_out:
-                        f_out.writelines(lines)
-                    try:
-                        os.remove(fallback_tmp)
-                    except Exception:
-                        pass
-                    return True
-                # last resort: let trimesh export explicit OBJ and we clean it
-                m.export(fallback_tmp, file_type='obj')
-                with open(fallback_tmp, "r", encoding="utf-8", errors="ignore") as f_in:
-                    lines = [L for L in f_in.readlines() if not (L.strip().lower().startswith("mtllib") or L.strip().lower().startswith("usemtl"))]
-                with open(export_path, "w", encoding="utf-8", errors="ignore") as f_out:
-                    f_out.writelines(lines)
-                try:
-                    os.remove(fallback_tmp)
+                    with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                        lf.write(msg + "\n")
                 except Exception:
                     pass
-                return True
-            except Exception as ex2:
-                if debug:
-                    print(f"[MAYA_FIX] fallback failed: {ex2}")
-                return False
-
-    except Exception as fatal:
+        else:
+            if debug:
+                print("[SCALE] mesh scale ~= 1.0; no action")
+        return True
+    except Exception as ex:
         if debug:
-            print(f"[MAYA_FIX] Unexpected error: {fatal}")
+            print(f"[SCALE] failed: {ex}")
         return False
 
-# Directories
-BASE_DIR = os.path.dirname(__file__)
-os.chdir(BASE_DIR)
-EXPORT_ROOT = os.path.join(BASE_DIR, "exported_meshes")
-os.makedirs(EXPORT_ROOT, exist_ok=True)
-REPORTS_DIR = os.path.join(BASE_DIR, "reports")
-os.makedirs(REPORTS_DIR, exist_ok=True)
-
-# remap matrix
-remap_R = None
-if AXES_MAP_SPEC:
+def verify_pre_scale_integrity(mesh, positions, export_log_path=None, tol=0.20):
+    """
+    Compare voxel-expected extents to mesh bounds before final mesh-scale.
+    Returns True if mesh extents are within tol (relative) of expected extents.
+    tol is the allowed fractional deviation (default 20%).
+    This function logs details to export_log_path when provided.
+    """
     try:
-        remap_R = parse_axes_map(AXES_MAP_SPEC)
+        if positions is None or positions.size == 0:
+            return True
+        positions = np.asarray(positions, dtype=float)
+        pmin = positions.min(axis=0)
+        pmax = positions.max(axis=0)
+        expected_ext = ((pmax - pmin) + 1.0) * float(args.voxel_size)
+        bounds = np.asarray(mesh.bounds, dtype=float)
+        mesh_ext = bounds[1] - bounds[0]
+        eps = 1e-8
+        # Avoid division by zero: where expected_ext is tiny, skip that axis
+        ratios = []
+        for i in range(3):
+            if expected_ext[i] <= eps or mesh_ext[i] <= eps:
+                ratios.append(1.0)
+            else:
+                ratios.append(mesh_ext[i] / expected_ext[i])
+        max_dev = max(abs(r - 1.0) for r in ratios)
+        if export_log_path:
+            try:
+                with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                    lf.write(f"[INTEGRITY] expected_ext={expected_ext.tolist()} mesh_ext={mesh_ext.tolist()} ratios={ratios} max_dev={max_dev:.4f} tol={tol}\n")
+            except Exception:
+                pass
+        return (max_dev <= tol)
     except Exception as ex:
-        print(f"Invalid axes map '{AXES_MAP_SPEC}': {ex}")
-        remap_R = None
+        if export_log_path:
+            try:
+                with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                    lf.write(f"[INTEGRITY_ERROR] {ex}\n")
+            except Exception:
+                pass
+        return True
 
-def load_reference_mappings(vox_name):
-    refs = []
-    csv_path = os.path.join(REPORTS_DIR, f"FinalMapping_{vox_name}.csv")
-    if os.path.exists(csv_path):
+def apply_maya_compatibility_export(mesh: trimesh.Trimesh, export_path: str) -> bool:
+    # manual OBJ writer, returns False if mesh empty
+    if not hasattr(mesh, 'vertices') or not hasattr(mesh, 'faces') or len(getattr(mesh, 'faces', [])) == 0:
+        return False
+    try:
+        mesh.process()
         try:
-            with open(csv_path, newline='', encoding='utf-8', errors='ignore') as f:
-                reader = csv.DictReader(f)
-                for r in reader:
-                    raw = (r.get("RawPart") or r.get(" RawPart") or "").strip()
-                    nm = (r.get("IntendedName") or "").strip()
-                    cnt = r.get("VoxelCount")
-                    try:
-                        cntv = int(cnt) if cnt not in (None, "") else None
-                    except Exception:
-                        cntv = None
-                    if raw and nm:
-                        refs.append({"raw": raw, "name": nm, "count": cntv})
-            return refs
+            if mesh.faces.ndim == 2 and mesh.faces.shape[1] != 3:
+                mesh = mesh.copy().triangulate()
         except Exception:
-            pass
-    dbg_path = os.path.join(REPORTS_DIR, f"DebugNameMap_{vox_name}.txt")
-    if os.path.exists(dbg_path):
-        try:
-            with open(dbg_path, "r", encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("Part_") and "=>" in line:
-                        try:
-                            left, right = line.split("=>", 1)
-                            left = left.strip()
-                            right = right.strip()
-                            if "(" in left and "voxels" in left:
-                                part = left.split("(", 1)[0].strip()
-                                cnt_part = left.split("(", 1)[1].split("voxels",1)[0].strip()
-                                try:
-                                    cntv = int(cnt_part)
-                                except Exception:
-                                    cntv = None
-                            else:
-                                part = left
-                                cntv = None
-                            refs.append({"raw": part, "name": right, "count": cntv})
-                        except Exception:
-                            continue
-            return refs
-        except Exception:
-            pass
-    return refs
+            mesh = mesh.copy().triangulate()
+        if not hasattr(mesh, 'vertex_normals') or mesh.vertex_normals.shape[0] != mesh.vertices.shape[0]:
+            mesh.compute_vertex_normals()
+        temp_path = export_path + ".tmp"
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            f.write(f"# MagicaVoxel Export - Processed by ExportMeshes.py\n")
+            f.write(f"o {os.path.splitext(os.path.basename(export_path))[0]}\n")
+            for v in mesh.vertices:
+                f.write('v {:.6f} {:.6f} {:.6f}\n'.format(*v))
+            for vn in mesh.vertex_normals:
+                f.write('vn {:.6f} {:.6f} {:.6f}\n'.format(*vn))
+            for face in mesh.faces:
+                idxs = (face + 1).tolist()
+                if len(idxs) == 3:
+                    v1, v2, v3 = idxs
+                    f.write(f'f {v1}//{v1} {v2}//{v2} {v3}//{v3}\n')
+                else:
+                    for a in range(1, len(idxs)-1):
+                        f.write(f'f {idxs[0]}//{idxs[0]} {idxs[a]}//{idxs[a]} {idxs[a+1]}//{idxs[a+1]}\n')
+        os.replace(temp_path, export_path)
+        return True
+    except Exception as ex:
+        if args.debug:
+            print(f"[DEBUG] Failed manual OBJ export for {os.path.basename(export_path)}: {ex}")
+            traceback.print_exc(file=sys.stdout)
+        return False
 
-def find_best_ref_by_count(refs, count, tol_abs=3, tol_rel=0.02):
-    if count is None:
-        return None
-    matches = []
-    for e in refs:
-        ec = e.get("count")
-        if ec is None:
-            continue
-        diff = abs(ec - count)
-        rel = diff / max(1.0, ec)
-        if diff <= tol_abs or rel <= tol_rel:
-            matches.append((diff, rel, e))
-    if not matches:
-        return None
-    matches.sort(key=lambda x: (x[0], x[1]))
-    if len(matches) > 1 and matches[0][0] == matches[1][0] and matches[0][1] == matches[1][1]:
-        return None
-    return matches[0][2]
+# ----------------- Main Export -----------------
 
-# Main export loop
-vox_files = [f for f in os.listdir(BASE_DIR) if f.lower().endswith(".vox")]
-if args.vox:
-    target = f"{args.vox}.vox"
-    if target in vox_files:
-        vox_files = [target]
-    else:
-        print(f"Specified vox not found: {args.vox}")
-        vox_files = []
+def run_export(vox_file, AXES_MAP_SPEC):
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    EXPORT_ROOT = os.path.join(BASE_DIR, "exported_meshes")
+    REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+    os.makedirs(EXPORT_ROOT, exist_ok=True)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
 
-if not vox_files:
-    print("No .vox files found.")
-    sys.exit(0)
-
-for vox_file in vox_files:
     vox_path = os.path.join(BASE_DIR, vox_file)
     vox_name = os.path.splitext(vox_file)[0]
     sub_export_dir = os.path.join(EXPORT_ROOT, vox_name)
     os.makedirs(sub_export_dir, exist_ok=True)
 
-    # CLEANUP: remove existing .obj files to avoid accumulation across runs
+    orp_path = os.path.join(REPORTS_DIR, f"VoxelOverrideReport_{vox_name}.txt")
+    export_log_path = os.path.join(sub_export_dir, "ExportLog.txt")
+
+    # create early ExportLog so failures are visible
     try:
-        for old in glob.glob(os.path.join(sub_export_dir, "*.obj")):
-            try:
-                os.remove(old)
-            except Exception:
-                pass
+        with open(export_log_path, "w", encoding="utf-8", errors="replace") as lf:
+            lf.write(f"Export run for {vox_file} at {datetime.datetime.utcnow().isoformat()}Z\n")
+            lf.write(f"mesh_scale={MESH_SCALE}  scale_factor={args.scale_factor}  ignore_model_scale={args.ignore_model_scale}\n")
     except Exception:
         pass
 
     try:
         parser = Vox200Parser(vox_path).parse()
     except Exception as ex:
-        print(f"Failed to parse {vox_file}: {ex}")
-        continue
-
-    voxels_by_layer = parser.voxels_by_layer    # dict Part_X -> [Voxel]
-    name_map = parser.layer_name_map            # dict Part_X -> intended name
-
-    refs = load_reference_mappings(vox_name)
-
-    # Precompute stats and build ordered list of parts by numeric index
-    parts = []
-    for k in voxels_by_layer.keys():
+        err = f"Failed to parse {vox_file}: {ex}"
+        print(err)
         try:
-            idx = int(k.split("_", 1)[1])
+            with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                lf.write(err + "\n")
+                lf.write(traceback.format_exc() + "\n")
         except Exception:
-            idx = None
-        parts.append((idx, k))
-    parts.sort(key=lambda x: (x[0] if x[0] is not None else 1e9, x[1]))
-    ordered_parts = [p[1] for p in parts]
+            pass
+        try:
+            with open(orp_path, "w", encoding="utf-8", errors="replace") as orp:
+                orp.write(f"FATAL_ERROR: Failed to parse VOX file: {ex}\n")
+        except Exception:
+            pass
+        return
+
+    voxels_by_layer = getattr(parser, 'voxels_by_layer', {})
+    name_map = getattr(parser, 'layer_name_map', {})
+    raw_map = getattr(parser, 'raw_part_name_map', None)
+    model_transforms = getattr(parser, 'model_transforms', {})
 
     stats = {}
-    for raw_key in ordered_parts:
-        voxels = voxels_by_layer.get(raw_key, [])
-        cnt = len(voxels)
-        cent = compute_centroid(voxels) if cnt > 0 else None
-        stats[raw_key] = {"count": cnt, "centroid": cent}
+    for raw_key, voxels in voxels_by_layer.items():
+        stats[raw_key] = {"count": len(voxels), "centroid": compute_centroid(voxels)}
 
-    export_log_path = os.path.join(sub_export_dir, "ExportLog.txt")
-    override_report_path = os.path.join(REPORTS_DIR, f"VoxelOverrideReport_{vox_name}.txt")
-    layer_map_path = os.path.join(REPORTS_DIR, f"LayerMapping_{vox_name}.txt")
+    ordered_parts = sorted(voxels_by_layer.keys(), key=lambda k: int(k.split('_')[1]) if k.startswith('Part_') else 0)
+    AXES_TRANSFORM = get_axes_matrix(AXES_MAP_SPEC) if AXES_MAP_SPEC else np.identity(4)
+    used_filenames = set()
 
+    # open override report file
     try:
-        with open(layer_map_path, "w", encoding="utf-8", errors="replace") as lm:
-            lm.write(f"LayerMapping for: {vox_file}\n\n")
-            lm.write(f"{'Part':<12} {'VoxelCount':>10} {'ParserAssigned':<30}\n")
-            lm.write(f"{'-'*12} {'-'*10} {'-'*30}\n")
-            for raw_key in ordered_parts:
-                assigned = name_map.get(raw_key, raw_key)
-                cnt = stats[raw_key]["count"]
-                lm.write(f"{raw_key:<12} {cnt:10d} {str(assigned):<30}\n")
-    except Exception:
-        pass
-
-    try:
-        with open(export_log_path, "w", encoding="utf-8", errors="replace") as log_file:
-            log_file.write(f"Export Status & Layer Name Mapping for {vox_file}\n\n")
-    except Exception:
-        continue
-
-    try:
-        orp = open(override_report_path, "w", encoding="utf-8", errors="replace")
-        orp.write(f"Voxel Override Report for: {vox_file}\n\n")
-        orp.write("Part, VoxelCount, Centroid, ParserName, FinalName, NameSource, Reason\n")
+        orp = open(orp_path, "w", encoding="utf-8", errors="replace")
+        orp.write(f"Voxel Override Report for: {vox_file}\n")
+        orp.write("RawPart,VoxelCount,Centroid (x,y,z),ParserAssigned,FinalName,NameSource,Reason\n")
     except Exception:
         orp = None
 
-    used_filenames = set()
+    integrity_fail_count = 0
 
     for raw_key in ordered_parts:
         voxels = voxels_by_layer.get(raw_key, [])
         voxel_count = len(voxels)
         if voxel_count == 0:
-            with open(export_log_path, "a", encoding="utf-8", errors="replace") as log_file:
-                log_file.write(f"Skipping empty model: {raw_key}\n")
-            if orp:
-                orp.write(f"{raw_key},0,,{name_map.get(raw_key)},,skipped,empty\n")
             continue
 
-        parser_assigned = name_map.get(raw_key) or ""
-        final_name = parser_assigned
+        parser_assigned = (raw_map.get(raw_key) if raw_map is not None else name_map.get(raw_key)) or ""
+        final_name = parser_assigned or raw_key
         name_source = "layer_name_map"
         reason = ""
-
-        if refs:
-            best_ref = find_best_ref_by_count(refs, voxel_count, tol_abs=3, tol_rel=0.02)
-            if best_ref:
-                if best_ref["raw"] != raw_key:
-                    final_name = best_ref["name"]
-                    name_source = "finalmapping_override"
-                    reason = f"count_match (ref {best_ref['raw']} count={best_ref.get('count')})"
-                else:
-                    final_name = best_ref["name"] or parser_assigned
-                    name_source = "finalmapping_confirm"
-                    reason = "ref_confirm_same_raw"
-            else:
-                if (not parser_assigned) or (parser_assigned == raw_key) or parser_assigned.startswith("_"):
-                    fuzzy = find_best_ref_by_count(refs, voxel_count, tol_abs=max(3, int(0.01*voxel_count)), tol_rel=0.05)
-                    if fuzzy and fuzzy["raw"] != raw_key:
-                        final_name = fuzzy["name"]
-                        name_source = "finalmapping_fuzzy"
-                        reason = f"fuzzy_count_match (ref {fuzzy['raw']} count={fuzzy.get('count')})"
-
-        if not final_name:
-            final_name = parser_assigned or raw_key
-            name_source = name_source or "fallback"
 
         safe_name = sanitize_filename(final_name) or raw_key
         base = safe_name
@@ -510,188 +347,318 @@ for vox_file in vox_files:
         used_filenames.add(target_path)
 
         try:
-            positions = np.array([[v.x, v.y, v.z] for v in voxels])
+            positions = np.array([[v.x, v.y, v.z] for v in voxels], dtype=float)
             cubes = []
             for pos in positions:
-                cube = trimesh.creation.box(extents=(1, 1, 1))
-                cube.apply_translation(pos)
+                cube = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+                cube.apply_translation(pos + 0.5)
                 cubes.append(cube)
+            if not cubes:
+                continue
+            combined = trimesh.util.concatenate(cubes)
 
-            if cubes:
-                combined = trimesh.util.concatenate(cubes)
-
-                # Apply per-model transform if present in parser.model_transforms
+            # model transforms
+            try:
+                model_idx = int(raw_key.split('_', 1)[1])
+            except Exception:
                 model_idx = None
+            model_transform_data = model_transforms.get(model_idx) or {}
+
+            # diagnostic: log model-level 's' (if any) and whether it was applied
+            s_val = model_transform_data.get('s')
+            try:
+                with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                    lf.write(f"[MODEL_TRANSFORM] {raw_key} model_idx={model_idx} model_s={s_val!r} ignore_model_scale={args.ignore_model_scale}\n")
+            except Exception:
+                pass
+
+            S_vox = np.eye(4)
+            # apply model s only if not ignored
+            s_val = model_transform_data.get('s')
+            if s_val is not None and not args.ignore_model_scale:
                 try:
-                    model_idx = int(raw_key.split("_",1)[1])
+                    if isinstance(s_val, (int, float)):
+                        S_vox[:3, :3] *= float(s_val)
+                    else:
+                        sv = list(map(float, s_val))
+                        S_vox[0,0], S_vox[1,1], S_vox[2,2] = sv[0], sv[1] if len(sv)>1 else sv[0], sv[2] if len(sv)>2 else sv[0]
                 except Exception:
-                    model_idx = None
-
-                attrs = getattr(parser, "model_transforms", {}).get(model_idx) if model_idx is not None else None
-                # --- Validate & apply per-model transform safely ---
-                if attrs:
-                    # parse translation
-                    tvals = None
-                    if "_t" in attrs:
-                        toks = [tok for tok in re.split(r"[,\s]+", attrs["_t"].strip()) if tok != ""]
-                        try:
-                            if len(toks) >= 3:
-                                tvals = [float(toks[0]), float(toks[1]), float(toks[2])]
-                        except Exception:
-                            tvals = None
-
-                    # parse rotation into a 4x4 matrix (quat [w,x,y,z] or euler deg triplet)
-                    rot_mat = None
-                    if "_r" in attrs:
-                        toks = [tok for tok in re.split(r"[,\s]+", attrs["_r"].strip()) if tok != ""]
-                        try:
-                            nums = [float(x) for x in toks]
-                            if len(nums) == 4:
-                                # try quaternion; ensure finite
-                                try:
-                                    candidate = quaternion_matrix(nums)
-                                except Exception:
-                                    # try alternate ordering [x,y,z,w]
-                                    candidate = quaternion_matrix([nums[3], nums[0], nums[1], nums[2]])
-                                    rot_mat = candidate
-                            elif len(nums) == 3:
-                                rx, ry, rz = [math.radians(a) for a in nums]
-                                rot_mat = euler_matrix(rx, ry, rz, axes='sxyz')
-                        except Exception:
-                            rot_mat = None
-
-                    # Validate rotation matrix (finite and non-singular)
-                    if rot_mat is not None:
-                        try:
-                            R3 = rot_mat[:3, :3].astype(float)
-                            if not np.isfinite(R3).all() or abs(np.linalg.det(R3)) < 1e-8:
-                                if args and getattr(args, "debug", False):
-                                    print(f"[DEBUG] Invalid rotation matrix for {raw_key}; ignoring rotation.")
-                                rot_mat = None
-                        except Exception:
-                            rot_mat = None
-
-                    # Validate translation: finite and within sane bounds
-                    MAX_T = 1e5
-                    if tvals is not None:
-                        try:
-                            tv = np.array(tvals, dtype=float)
-                            if not np.isfinite(tv).all() or np.any(np.abs(tv) > MAX_T):
-                                if args and getattr(args, "debug", False):
-                                    print(f"[DEBUG] Translation {tvals} out-of-range for {raw_key}; ignoring translation.")
-                                tvals = None
-                            else:
-                                tvals = tv.tolist()
-                        except Exception:
-                            tvals = None
-
-                    # Apply rotation then translation only if validated
-                    if rot_mat is not None:
-                        try:
-                            combined.apply_transform(rot_mat)
-                        except Exception:
-                            if args and getattr(args, "debug", False):
-                                print(f"[DEBUG] Failed to apply rotation for {raw_key}; skipping rotation.")
-                    if tvals is not None:
-                        try:
-                            combined.apply_translation(tvals)
-                        except Exception:
-                            if args and getattr(args, "debug", False):
-                                print(f"[DEBUG] Failed to apply translation for {raw_key}; skipping translation.")
-
-                # --- Post-transform robustness: normalize numeric ranges & recompute normals ---
-                try:
-                    # force float32 and limit decimals to reduce export noise
-                    verts = np.asarray(combined.vertices, dtype=np.float32)
-                    verts = np.round(verts, 6)
-                    combined.vertices = verts
-
-                    # remove degenerate / duplicate / unreferenced geometry
+                    if args.debug:
+                        print(f"[DEBUG] invalid model scale for {raw_key}: {s_val}")
+            else:
+                if s_val is not None and args.ignore_model_scale and args.debug:
                     try:
-                        combined.remove_degenerate_faces()
-                        combined.remove_duplicate_faces()
-                        combined.remove_unreferenced_vertices()
+                        with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                            lf.write(f"[INFO] Ignored model 's' for {raw_key}: {s_val}\n")
                     except Exception:
                         pass
 
-                    # ensure there are faces and triangle topology
-                    if not hasattr(combined, "faces") or combined.faces.size == 0:
-                        # skip export of empty/invalid mesh
-                        raise RuntimeError("mesh has no faces after cleanup")
-
-                    # recompute normals so OBJ contains vn lines
+            # rotation
+            R_vox = np.eye(4)
+            q = model_transform_data.get('r')
+            if q is not None:
+                q_safe = _reorder_quaternion_for_trimesh(q)
+                if q_safe is not None:
                     try:
-                        combined.fix_normals()
+                        R_vox = quaternion_matrix(q_safe)
+                    except Exception:
+                        if args.debug:
+                            print(f"[DEBUG] quaternion_matrix failed for {raw_key} q={q_safe}")
+            else:
+                e = model_transform_data.get('e')
+                if e is not None:
+                    try:
+                        R_vox = euler_matrix(float(e[0]), float(e[1]), float(e[2]), axes='sxyz')
+                    except Exception:
+                        if args.debug:
+                            print(f"[DEBUG] invalid euler for {raw_key}: {e}")
+
+            # translation
+            t = _safe_translation_vec(model_transform_data.get('t'))
+            T_vox = translation_matrix(t) if t is not None else np.eye(4)
+
+            # Compose and apply
+            vox_transform = T_vox.dot(R_vox).dot(S_vox)
+            combined.apply_transform(vox_transform)
+
+            # log bounds after applying voxel transforms (before extent correction)
+            try:
+                bounds_after_vox = combined.bounds.copy()
+                with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                    lf.write(f"[BOUNDS_AFTER_VOX_TRANSFORM] {raw_key} bounds={bounds_after_vox.tolist()}\n")
+            except Exception:
+                pass
+
+            # axis remap
+            if AXES_MAP_SPEC:
+                combined = remap_axes(combined, AXES_MAP_SPEC)
+
+            # extent correction
+            try:
+                if not args.no_extent_correction:
+                    ensure_voxel_scale(combined, positions, voxel_size=args.voxel_size,
+                                       export_log_path=os.path.join(REPORTS_DIR, f"ScaleFix_{safe_name}.log"),
+                                       debug=args.debug)
+            except Exception as ex:
+                if args.debug:
+                    print(f"[DEBUG] ensure_voxel_scale failed for {safe_name}: {ex}")
+                try:
+                    with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                        lf.write(f"[DEBUG] ensure_voxel_scale failed for {safe_name}: {ex}\n")
+                except Exception:
+                    pass
+
+            # integrity check (logs to ExportLog.txt)
+            pre_scale_ok = True
+            try:
+                pre_scale_ok = verify_pre_scale_integrity(combined, positions, export_log_path=export_log_path)
+            except Exception:
+                pre_scale_ok = True
+            if not pre_scale_ok:
+                integrity_fail_count += 1
+            if not pre_scale_ok and args.debug:
+                msg = f"[WARN] Pre-scale integrity check failed for {raw_key} - possible early scaling."
+                print(msg)
+                try:
+                    with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                        lf.write(msg + "\n")
+                except Exception:
+                    pass
+
+            # final mesh scale (applied to mesh only)
+            if abs(MESH_SCALE - 1.0) > 1e-12:
+                S_extra = np.eye(4); S_extra[:3,:3] *= float(MESH_SCALE)
+                bounds_before = combined.bounds.copy() if hasattr(combined, "bounds") else None
+                combined.apply_transform(S_extra)
+                bounds_after = combined.bounds.copy() if hasattr(combined, "bounds") else None
+                if args.debug:
+                    try:
+                        with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                            lf.write(f"[DEBUG] Part={raw_key} applied final mesh scale={MESH_SCALE}\n")
+                            lf.write(f"[DEBUG]   bounds_before={bounds_before.tolist() if bounds_before is not None else None}\n")
+                            lf.write(f"[DEBUG]   bounds_after ={bounds_after.tolist() if bounds_after is not None else None}\n")
                     except Exception:
                         pass
-                except Exception as ex:
-                    # If severe problems, skip this model export and log
-                    with open(export_log_path, "a", encoding="utf-8", errors="replace") as log_file:
-                        log_file.write(f"SKIP EXPORT (invalid geometry) {raw_key}: {ex}\n")
-                    if orp:
-                        orp.write(f"{raw_key},{voxel_count},,ERROR_EXPORT_INVALID_GEOM,,,\n")
-                    continue
 
-                # Apply axes remap if requested (remap_R maps new = R @ old)
-                if remap_R is not None:
-                    R4 = np.eye(4, dtype=float)
-                    R4[:3, :3] = remap_R
-                    combined.apply_transform(R4)
+            # Ensure there is geometry to write; try repair/fallback if empty
+            faces_count = getattr(combined, "faces", None)
+            face_len = 0
+            try:
+                face_len = int(len(faces_count)) if faces_count is not None else 0
+            except Exception:
+                face_len = 0
 
-                # --- Stable OBJ export ------------------------------
-                export_ok = False
+            # If no faces, try to repair / create fallback
+            fallback_used = False
+            if face_len == 0:
+                # try process, fill holes, recompute
                 try:
-                    export_ok = apply_maya_compatibility_export(combined, target_path, debug=getattr(args, "debug", False), hard_edges=args.hard_edges)
-                except Exception as ex:
-                    if getattr(args, "debug", False):
-                        print(f"[DEBUG] apply_maya_compatibility_export threw: {ex}")
+                    combined.process()
+                    if hasattr(combined, "faces"):
+                        face_len = len(combined.faces)
+                except Exception:
+                    pass
 
-                if not export_ok:
-                    # Last-resort attempts: try stable writer on original, then trimesh default exporter
-                    try:
-                        write_stable_obj(target_path, combined)
-                        export_ok = True
-                    except Exception:
+            if face_len == 0:
+                # attempt convex hull as fallback
+                try:
+                    hull = combined.convex_hull
+                    if hull is not None and hasattr(hull, "faces") and len(hull.faces) > 0:
+                        combined = hull
+                        fallback_used = True
                         try:
-                            tmp = target_path + ".tmp.obj"
-                            combined.export(tmp, file_type='obj')
-                            os.replace(tmp, target_path)
-                            export_ok = True
-                        except Exception as ex2:
-                            export_ok = False
-                            if getattr(args, "debug", False):
-                                print(f"[DEBUG] Final fallback export failed for {target_path}: {ex2}")
+                            with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                                lf.write(f"[FALLBACK] Used convex_hull for {raw_key}\n")
+                        except Exception:
+                            pass
+                        face_len = len(getattr(combined, "faces", []))
+                except Exception:
+                    pass
 
-                if not export_ok:
-                    with open(export_log_path, "a", encoding="utf-8", errors="replace") as log_file:
-                        log_file.write(f"ERROR: Failed to export {raw_key} as {os.path.basename(target_path)}\n")
-                else:
-                    with open(export_log_path, "a", encoding="utf-8", errors="replace") as log_file:
-                        log_file.write(f"Exported {raw_key} ({voxel_count} voxels) as {os.path.basename(target_path)} (source={name_source})\n")
+            if face_len == 0:
+                # ultimate fallback: write a tiny cube at centroid so you get an OBJ file
+                try:
+                    cen = np.array([0.0, 0.0, 0.0])
+                    if positions is not None and positions.size:
+                        cen = positions.mean(axis=0) + 0.5
+                    tiny = trimesh.creation.box(extents=(0.001, 0.001, 0.001))
+                    tiny.apply_translation(cen)
+                    combined = tiny
+                    fallback_used = True
+                    try:
+                        with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                            lf.write(f"[FALLBACK] Wrote tiny placeholder cube for {raw_key}\n")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
-            if orp:
-                cent = stats[raw_key]["centroid"] if raw_key in stats else None
-                cent_str = ",".join([f"{x:.3f}" for x in cent]) if cent is not None else ""
-                orp.write(f"{raw_key},{voxel_count},{cent_str},{parser_assigned},{final_name},{name_source},{reason}\n")
+            # export
+            exported_ok = False
+            try:
+                # prefer manual writer for Maya compatibility when possible
+                if not apply_maya_compatibility_export(combined, target_path):
+                    combined.export(target_path, file_type='obj')
+                exported_ok = True
+            except Exception as ex:
+                exported_ok = False
+                try:
+                    with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                        lf.write(f"ERROR exporting {raw_key}: {ex}\n")
+                        lf.write(traceback.format_exc() + "\n")
+                except Exception:
+                    pass
+                if args.debug:
+                    print(f"[ERROR] failed to write OBJ for {raw_key}: {ex}")
+                    traceback.print_exc()
+
+            # log
+            try:
+                with open(export_log_path, "a", encoding="utf-8", errors="replace") as log_file:
+                    if exported_ok:
+                        log_file.write(f"Exported {raw_key} ({voxel_count} voxels) as {os.path.basename(target_path)}\n")
+                    else:
+                        log_file.write(f"FAILED_EXPORT {raw_key} ({voxel_count}) -> {os.path.basename(target_path)}\n")
+            except Exception:
+                pass
+
+            try:
+                if orp:
+                    cent = stats[raw_key]["centroid"] if raw_key in stats else None
+                    cent_str = ",".join([f"{x:.3f}" for x in cent]) if cent is not None else ""
+                    orp.write(f"{raw_key},{voxel_count},{cent_str},{parser_assigned},{final_name},{name_source},{reason}\n")
+            except Exception:
+                pass
+
         except Exception as ex:
-            with open(export_log_path, "a", encoding="utf-8", errors="replace") as log_file:
-                log_file.write(f"ERROR exporting {raw_key}: {ex}\n")
-                log_file.write(traceback.format_exc() + "\n")
-            if orp:
-                orp.write(f"{raw_key},{voxel_count},,ERROR_EXPORT,,,\n")
+            # per-part failure: log and continue
+            try:
+                with open(export_log_path, "a", encoding="utf-8", errors="replace") as lf:
+                    lf.write(f"EXCEPTION exporting {raw_key}: {ex}\n")
+                    lf.write(traceback.format_exc() + "\n")
+            except Exception:
+                pass
+            if args.debug:
+                print(f"[EXCEPTION] exporting {raw_key}: {ex}")
+                traceback.print_exc()
+            try:
+                if orp:
+                    orp.write(f"{raw_key},{voxel_count},,ERROR_EXPORT,,,{ex}\n")
+            except Exception:
+                pass
 
-    if orp:
-        orp.close()
-
+    # final summary
     try:
         with open(export_log_path, "a", encoding="utf-8", errors="replace") as log_file:
             log_file.write("\n--- Layer Name Mapping ---\n")
             for raw_key in ordered_parts:
                 assigned = name_map.get(raw_key, raw_key)
                 cnt = stats[raw_key]["count"]
-                log_file.write(f"{raw_key:<12} {cnt:10d} {str(assigned):<30}\n")
-            log_file.write(f"\nCompleted export of {vox_name} to {EXPORT_ROOT}\n")
-    except Exception as ex:
-        print(f"Failed to finalize export log: {ex}")
+                log_file.write(f"  {raw_key:<10} ({cnt:4d} voxels) => {assigned}\n")
+    except Exception:
+        pass
 
-print("Export process completed.")
+    # append integrity summary to reports/ExportRunArgs.txt so batch can decide next-step
+    try:
+        inv_log = os.path.join(REPORTS_DIR, "ExportRunArgs.txt")
+        with open(inv_log, "a", encoding="utf-8", errors="replace") as lf:
+            lf.write(f"INTEGRITY_FAILS={integrity_fail_count}\n")
+    except Exception:
+        pass
+
+    try:
+        if orp:
+            orp.close()
+    except Exception:
+        pass
+
+# Entrypoint
+if __name__ == "__main__":
+    try:
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        os.chdir(BASE_DIR)
+
+        vox_files = [f for f in os.listdir(BASE_DIR) if f.lower().endswith(".vox")]
+        if args.vox:
+            target = f"{args.vox}.vox"
+            if target in vox_files:
+                vox_files = [target]
+            else:
+                print(f"Specified vox not found: {args.vox}")
+                sys.exit(1)
+        if not vox_files:
+            print("No .vox files found.")
+            sys.exit(0)
+
+        for vox_file in vox_files:
+            try:
+                run_export(vox_file, AXES_MAP_SPEC)
+            except Exception as ex_main:
+                # fatal per-file: write report
+                try:
+                    reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+                    os.makedirs(reports_dir, exist_ok=True)
+                    fatal_path = os.path.join(reports_dir, f"ExportMeshesFatal_{os.path.splitext(vox_file)[0]}.log")
+                    with open(fatal_path, "w", encoding="utf-8", errors="replace") as fh:
+                        fh.write(f"FATAL exception exporting {vox_file}: {ex_main}\n")
+                        fh.write(traceback.format_exc())
+                except Exception:
+                    pass
+                print(f"FATAL ERROR in exporting {vox_file}: {ex_main}")
+                if args.debug:
+                    traceback.print_exc()
+
+    except Exception as e:
+        print(f"FATAL ERROR in ExportMeshes.py main loop: {e}")
+        if args.debug:
+            traceback.print_exc()
+        try:
+            reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            fatal_path = os.path.join(reports_dir, f"ExportMeshesFatal_main.log")
+            with open(fatal_path, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write(f"FATAL main exception: {e}\n")
+                fh.write(traceback.format_exc())
+        except Exception:
+            pass
+        sys.exit(1)
