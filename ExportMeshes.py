@@ -598,14 +598,6 @@ def run_export(vox_file, AXES_MAP_SPEC):
     except Exception:
         pass
 
-    # append integrity summary to reports/ExportRunArgs.txt so batch can decide next-step
-    try:
-        inv_log = os.path.join(REPORTS_DIR, "ExportRunArgs.txt")
-        with open(inv_log, "a", encoding="utf-8", errors="replace") as lf:
-            lf.write(f"INTEGRITY_FAILS={integrity_fail_count}\n")
-    except Exception:
-        pass
-
     try:
         if orp:
             orp.close()

@@ -134,9 +134,12 @@ set "INTEGRITY_FAILS=0"
 if exist "%INV_LOG%" (
     set "MV_TMP=%TEMP%\mv_integrity.tmp"
     if exist "%MV_TMP%" del "%MV_TMP%" >nul 2>nul
-    findstr /B /I "INTEGRITY_FAILS=" "%INV_LOG%" > "%MV_TMP%" 2>nul || rem no match
+    rem capture any line that contains INTEGRITY_FAILS= (not just at beginning) to be robust to whitespace
+    findstr /I "INTEGRITY_FAILS=" "%INV_LOG%" > "%MV_TMP%" 2>nul || rem no match
     if exist "%MV_TMP%" (
-        set /p INTEGRITY_LINE=<"%MV_TMP%"
+        rem read last matching line (handles multiple matches)
+        for /f "usebackq tokens=* delims=" %%L in ("%MV_TMP%") do set "INTEGRITY_LINE=%%L"
+        rem extract value after =
         for /f "tokens=2 delims==" %%I in ("!INTEGRITY_LINE!") do set "INTEGRITY_FAILS=%%I"
         del "%MV_TMP%" >nul 2>nul
     )
@@ -161,8 +164,17 @@ if /I "%RENAME_ACTIVE%"=="1" (
 )
 echo [DBG] Normalized RENAME_ACTIVE=%RENAME_ACTIVE%
 
-:: Append audited flags
+:: Append audited flags (remove any prior INTEGRITY_FAILS/COMMIT_ALLOWED/RENAME_ACTIVE lines then append final single-line values)
 if exist "%INV_LOG%" (
+    set "TMP_INV=%TEMP%\ExportRunArgs.tmp"
+    if exist "%TMP_INV%" del "%TMP_INV%" >nul 2>nul
+    rem Filter out any previous marker lines (match anywhere in line) - use multiple /C: clauses to remove all three keys
+    findstr /V /I /C:"INTEGRITY_FAILS=" /C:"COMMIT_ALLOWED=" /C:"RENAME_ACTIVE=" "%INV_LOG%" > "%TMP_INV%" 2>nul || (
+        rem if findstr fails for any reason, copy original to tmp to preserve it
+        copy "%INV_LOG%" "%TMP_INV%" >nul 2>nul
+    )
+    rem Replace original log with filtered content (use move which overwrites)
+    move /Y "%TMP_INV%" "%INV_LOG%" >nul 2>nul
     >> "%INV_LOG%" echo COMMIT_ALLOWED=%COMMIT_ALLOWED%
     >> "%INV_LOG%" echo INTEGRITY_FAILS=%INTEGRITY_FAILS%
     >> "%INV_LOG%" echo RENAME_ACTIVE=%RENAME_ACTIVE%
